@@ -1,0 +1,37 @@
+# Hugging Face model cache (downloaded weights)
+hf_cache/
+
+# Rust compilation target directory
+target/
+Cargo.lock
+
+# Compiled binaries and shared libraries
+*.dll
+*.so
+*.dylib
+*.pyd
+*.a
+*.dll.a
+*.lib
+*.exp
+
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Pytest and benchmarking caches
+.pytest_cache/
+.benchmarks/
+
+# Local scratch and temporary files
+scratch/
+image.png
+*.log
+*.tmp
+
+# Environment and IDE files
+.venv/
+.env
+.vscode/
+.idea/
