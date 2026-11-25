@@ -90,6 +90,13 @@ def test_xgrammar_2_bitmask_compilation_and_gate():
 
     resolver = RefusalTokenResolver(tokenizer=tokenizer)
     parts = resolver.get_partitioned_masks(vocab_size)
+    from grammargate.bitmask_utils import unpack_bitmask
+    valid_cfg = unpack_bitmask(bm_cfg, vocab_size)[0]
+    masked_strict = torch.nonzero(parts["strict"] & (~valid_cfg), as_tuple=True)[0]
+    assert masked_strict.numel() > 0, (
+        f"Expected XGrammar {ver} Python CFG to mask at least one strict refusal token"
+    )
+
     gate = PreMaskLogitGate(
         refusal_mask=parts["combined"],
         strict_refusal_mask=parts["strict"],
@@ -100,9 +107,9 @@ def test_xgrammar_2_bitmask_compilation_and_gate():
         vocab_size=vocab_size,
     )
 
-    sorry_id = tokenizer.encode("Sorry", add_special_tokens=False)[0]
-    logits = torch.full((1, vocab_size), -6.0)
-    logits[0, sorry_id] = 8.0  # Strong masked refusal intent under Python CFG
+    masked_ref_id = int(masked_strict[0].item())
+    logits = torch.full((1, vocab_size), -20.0)
+    logits[0, masked_ref_id] = 8.0  # Strong masked refusal intent under Python CFG
 
     dec = gate.inspect_pre_mask(logits, bm_cfg)
     assert dec.should_trip is True, f"XGrammar {ver} Python CFG bitmask must trigger refusal trip"
