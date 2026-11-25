@@ -42,19 +42,52 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install --upgrade pytest "xgrammar>=0.2.9" transformers numpy pydantic jsonschema
 
-      - name: Run Python CPU-compatible unit and benchmark tests
+      - name: Run Rust FFI & Native XGrammar Tests
         env:
           PYTHONPATH: .
         run: |
           pytest tests/test_rust_core.py \
                  tests/test_rust_analyzer.py \
                  tests/test_native_xgrammar_ci.py \
-                 tests/test_logit_gate.py \
+                 -v --tb=short --junitxml=pytest-native.xml
+
+      - name: Run Gate, Escalator & vLLM Adapter Tests
+        env:
+          PYTHONPATH: .
+        run: |
+          pytest tests/test_logit_gate.py \
                  tests/test_escalator.py \
                  tests/test_vllm_adapter.py \
-                 tests/test_speclook_gate.py \
+                 -v --tb=short --junitxml=pytest-core.xml
+
+      - name: Run SpecLook & HS-Gate Tests
+        env:
+          PYTHONPATH: .
+        run: |
+          pytest tests/test_speclook_gate.py \
                  tests/test_hs_gate.py \
-                 tests/test_ablation_runner.py \
+                 -v --tb=short --junitxml=pytest-gates.xml
+
+      - name: Run Ablation & CDA Benchmark Suites
+        env:
+          PYTHONPATH: .
+        run: |
+          pytest tests/test_ablation_runner.py \
                  benchmarks/attacks/ \
                  benchmarks/utility/ \
-                 -v
+                 -v --tb=short --junitxml=pytest-bench.xml
+
+      - name: Emit Pytest Failure Annotations
+        if: failure()
+        run: |
+          python -c '
+          import glob, xml.etree.ElementTree as ET
+          for path in sorted(glob.glob("pytest-*.xml")):
+              root = ET.parse(path).getroot()
+              for tc in root.iter("testcase"):
+                  for fail in list(tc.findall("failure")) + list(tc.findall("error")):
+                      name = tc.attrib.get("name", "unknown")
+                      cls = tc.attrib.get("classname", "")
+                      msg = (fail.attrib.get("message", "") or fail.text or "").strip().replace("\n", " | ")[:400]
+                      print(f"::error title={cls}.{name}::{msg}")
+          '
