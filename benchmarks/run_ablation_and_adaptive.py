@@ -49,6 +49,7 @@ from grammargate.hs_probe import (
     format_chat_prompt,
 )
 from grammargate.model_utils import resolve_model_path
+from grammargate.native_checks import assert_native_l1_ready, assert_xgrammar_ready
 
 
 def _is_dict_lookup_key_py(key: str) -> bool:
@@ -566,11 +567,11 @@ def _extract_raw_instruction(prompt: str) -> str:
 def run_ablation(
     model_id: str = "Qwen/Qwen2.5-0.5B-Instruct",
     n_per_category: int = 5,
-    mask_backend: str = "auto",
+    mask_backend: str = "xgrammar",
     max_new_tokens: int = 16,
     output_jsonl: str | None = None,
-    require_native_l1: bool = False,
-    require_xgrammar: bool = False,
+    require_native_l1: bool = True,
+    require_xgrammar: bool = True,
     multilingual_calibration: bool = False,
 ) -> Dict[str, Any]:
     _local_hf = Path(__file__).resolve().parent.parent / "hf_cache"
@@ -578,19 +579,13 @@ def run_ablation(
         os.environ.setdefault("HF_HOME", str(_local_hf))
 
     if require_native_l1:
-        try:
-            from grammargate.analyzer import analyze_schema as _preflight_l1  # noqa: F401
-        except Exception as exc:
-            raise RuntimeError(f"Native Rust L1 analyzer required (--require-native-l1) but unavailable: {exc}") from exc
+        assert_native_l1_ready()
 
     if require_xgrammar and mask_backend == "token_mask":
         raise RuntimeError("Real xgrammar required (--require-xgrammar), cannot use token_mask backend.")
     if require_xgrammar:
         mask_backend = "xgrammar"
-        try:
-            import xgrammar as _preflight_xgr  # noqa: F401
-        except Exception as exc:
-            raise RuntimeError(f"Real xgrammar required (--require-xgrammar) but unavailable: {exc}") from exc
+        assert_xgrammar_ready()
 
     resolved = resolve_model_path(model_id, env_var="HF_MODEL_PATH")
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -613,12 +608,14 @@ def run_ablation(
     if mask_backend in ("auto", "xgrammar"):
         try:
             import xgrammar as xgr
-            tok_info = xgr.TokenizerInfo.from_huggingface(tokenizer)
+            if require_xgrammar:
+                assert_xgrammar_ready()
+            tok_info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
             compiler = xgr.GrammarCompiler(tok_info)
             mask_backend = "xgrammar"
         except Exception as exc:
             if mask_backend == "xgrammar" or require_xgrammar:
-                raise RuntimeError(f"Real xgrammar required (--require-xgrammar) but unavailable: {exc}") from exc
+                raise RuntimeError(f"Real xgrammar>=0.2.9 required (--require-xgrammar) but unavailable: {exc}") from exc
             print(f"[Info] xgrammar unavailable ({exc}); using pure-PyTorch bitmask backend.")
             mask_backend = "token_mask"
 
@@ -876,7 +873,9 @@ def run_ablation(
 def run_multilingual_hs_ab_test(
     model_id: str = "Qwen/Qwen2.5-0.5B-Instruct",
     max_new_tokens: int = 20,
-    mask_backend: str = "auto",
+    mask_backend: str = "xgrammar",
+    require_native_l1: bool = True,
+    require_xgrammar: bool = True,
 ) -> Dict[str, Any]:
     """
     Targeted A/B comparison of English-only vs. Multilingual (EN/ES/FR/HI/ZH) HS-Gate calibration
@@ -886,6 +885,14 @@ def run_multilingual_hs_ab_test(
     _local_hf = Path(__file__).resolve().parent.parent / "hf_cache"
     if _local_hf.is_dir():
         os.environ.setdefault("HF_HOME", str(_local_hf))
+
+    if require_native_l1:
+        assert_native_l1_ready()
+    if require_xgrammar and mask_backend == "token_mask":
+        raise RuntimeError("Real xgrammar required (--require-xgrammar), cannot use token_mask backend.")
+    if require_xgrammar:
+        mask_backend = "xgrammar"
+        assert_xgrammar_ready()
 
     resolved = resolve_model_path(model_id, env_var="HF_MODEL_PATH")
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -900,10 +907,14 @@ def run_multilingual_hs_ab_test(
     if mask_backend in ("auto", "xgrammar"):
         try:
             import xgrammar as xgr
-            tok_info = xgr.TokenizerInfo.from_huggingface(tokenizer)
+            if require_xgrammar:
+                assert_xgrammar_ready()
+            tok_info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
             compiler = xgr.GrammarCompiler(tok_info)
             mask_backend = "xgrammar"
-        except Exception:
+        except Exception as exc:
+            if mask_backend == "xgrammar" or require_xgrammar:
+                raise RuntimeError(f"Real xgrammar>=0.2.9 required (--require-xgrammar) but unavailable: {exc}") from exc
             mask_backend = "token_mask"
 
     suites = build_disjoint_eval_suites(n_per_category=5)
@@ -953,6 +964,7 @@ def run_multilingual_hs_ab_test(
                     l1_elev, _, _ = _try_l1_report(
                         task["schema"] if task["mode"] == "json" else task["grammar_ebnf"],
                         is_json=(task["mode"] == "json"),
+                        require_native_l1=require_native_l1,
                     )
                     proc = GrammarGateHfProcessor(
                         tokenizer=tokenizer,
@@ -1021,32 +1033,39 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="GrammarGate Ablation & Adaptive Evaluation Runner")
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--samples-per-category", type=int, default=4)
-    parser.add_argument("--mask-backend", choices=["auto", "xgrammar", "token_mask"], default="auto")
+    parser.add_argument("--mask-backend", choices=["auto", "xgrammar", "token_mask"], default="xgrammar")
     parser.add_argument("--max-new-tokens", type=int, default=14)
     parser.add_argument("--output", type=str, default=None)
-    parser.add_argument("--require-native-l1", action="store_true", help="Fail loudly if native Rust grammargate_core cannot load")
-    parser.add_argument("--require-xgrammar", action="store_true", help="Fail loudly if native xgrammar cannot load")
-    parser.add_argument("--allow-fallback", action="store_true", help="Allow Python/token_mask fallback on Linux/WSL2")
+    parser.add_argument("--require-native-l1", action="store_true", default=True, help="Fail loudly if native Rust grammargate_core cannot load (default: enabled)")
+    parser.add_argument("--require-xgrammar", action="store_true", default=True, help="Fail loudly if native xgrammar>=0.2.9 cannot load (default: enabled)")
+    parser.add_argument("--allow-fallback", action="store_true", help="Explicitly allow Python L1 / token_mask fallback on restricted Windows dev hosts")
     parser.add_argument("--multilingual-calibration", action="store_true", help="Use EN/ES/FR/HI/ZH calibration for HS-Gate")
     parser.add_argument("--ab-multilingual", action="store_true", help="Run targeted A/B test of English vs. multilingual HS-Gate calibration")
     args = parser.parse_args()
 
-    is_linux = sys.platform.startswith("linux")
-    req_l1 = args.require_native_l1 or (is_linux and not args.allow_fallback and args.mask_backend != "token_mask")
-    req_xg = args.require_xgrammar or (is_linux and not args.allow_fallback and args.mask_backend != "token_mask")
+    if args.allow_fallback:
+        req_l1 = False
+        req_xg = False
+        backend = "auto" if args.mask_backend == "xgrammar" else args.mask_backend
+    else:
+        req_l1 = bool(args.require_native_l1)
+        req_xg = bool(args.require_xgrammar)
+        backend = args.mask_backend
 
     if args.ab_multilingual:
         run_multilingual_hs_ab_test(
             model_id=args.model_id,
             max_new_tokens=args.max_new_tokens,
-            mask_backend=args.mask_backend,
+            mask_backend=backend,
+            require_native_l1=req_l1,
+            require_xgrammar=req_xg,
         )
         return
 
     run_ablation(
         model_id=args.model_id,
         n_per_category=args.samples_per_category,
-        mask_backend=args.mask_backend,
+        mask_backend=backend,
         max_new_tokens=args.max_new_tokens,
         output_jsonl=args.output,
         require_native_l1=req_l1,

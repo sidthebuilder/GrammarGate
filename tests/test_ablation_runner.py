@@ -76,8 +76,10 @@ def test_require_native_flags_fail_loudly_when_blocked(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", _block_native)
     with pytest.raises(RuntimeError, match="--require-native-l1"):
         _try_l1_report('{"type":"object","properties":{"a":{"type":"string"}}}', is_json=True, require_native_l1=True)
+    with pytest.raises(RuntimeError, match="--require-native-l1"):
+        run_ablation(n_per_category=1)
     with pytest.raises(RuntimeError, match="--require-xgrammar"):
-        run_ablation(n_per_category=1, mask_backend="token_mask", require_xgrammar=True)
+        run_ablation(n_per_category=1, mask_backend="token_mask", require_native_l1=False, require_xgrammar=True)
 
 
 def test_ablation_runner_smoke_on_cached_qwen():
@@ -86,6 +88,8 @@ def test_ablation_runner_smoke_on_cached_qwen():
         n_per_category=2,
         mask_backend="token_mask",
         max_new_tokens=8,
+        require_native_l1=False,
+        require_xgrammar=False,
     )
     assert set(summary.keys()) == {"Unguarded", "Static-L1-Only", "Lexical-L2", "SpecLook-Gate", "HS-Gate", "Combined"}
     for mode_name, stats in summary.items():

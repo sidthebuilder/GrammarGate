@@ -22,7 +22,7 @@ if modal is not None:
         .apt_install("curl", "build-essential")
         .run_commands("curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y")
         .env({"PATH": "/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin"})
-        .pip_install("torch>=2.4.0", "transformers>=4.48.0", "xgrammar>=0.1.34", "vllm>=0.7.0", "pytest", "numpy")
+        .pip_install("torch>=2.4.0", "transformers>=4.48.0", "xgrammar>=0.2.9", "vllm>=0.7.0", "datasets>=2.20.0", "scipy>=1.11.0", "pytest", "numpy")
         .add_local_dir(".", remote_path="/workspace")
         .run_commands(
             "cd /workspace && cargo test --manifest-path grammargate_core/Cargo.toml --verbose",
@@ -43,12 +43,9 @@ if modal is not None:
         import sys
         sys.path.insert(0, "/workspace")
 
-        # Fail loudly if native Rust L1 analyzer or real XGrammar cannot load
-        import xgrammar as xgr  # noqa: F401
-        from grammargate.analyzer import analyze_schema
-        test_rep = analyze_schema('{"type":"object","properties":{"status":{"type":"string","enum":["ok","err"]}}}')
-        if test_rep.is_elevated:
-            raise RuntimeError("Benign multi-option enum schema unexpectedly elevated in Rust L1 sanity check")
+        from grammargate.native_checks import assert_native_l1_ready, assert_xgrammar_ready
+        assert_native_l1_ready()
+        assert_xgrammar_ready()
 
         from benchmarks.run_ablation_and_adaptive import run_ablation
         safe_slug = model_id.replace("/", "_")

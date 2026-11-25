@@ -16,21 +16,25 @@ Saves raw per-sample traces to benchmarks/results_real_3b.jsonl.
 """
 
 import sys
+from pathlib import Path
+_ROOT = str(Path(__file__).resolve().parent.parent)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 sys.modules["torchvision"] = None
 
+import argparse
 import os
 import time
 import json
 from typing import Any, Dict, List
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList
-import xgrammar as xgr
 
 from grammargate.adapters.hf_processor import GrammarGateHfProcessor
-from grammargate.analyzer import analyze_schema
 from grammargate.escalator import RollingEscalator
 from grammargate.gate import GateConfig
 from grammargate.bitmask_utils import unpack_bitmask
+from grammargate.native_checks import assert_native_l1_ready, assert_xgrammar_ready
 
 from grammargate.model_utils import resolve_model_path
 
@@ -297,8 +301,16 @@ class UnguardedXGrammarHfProcessor(LogitsProcessor):
         return scores
 
 
-def run_evaluation():
-    print(f"=== GrammarGate Real GPU Evaluation Runner ===")
+def run_evaluation(require_native_l1: bool = True, require_xgrammar: bool = True):
+    if require_native_l1:
+        assert_native_l1_ready()
+    if require_xgrammar:
+        assert_xgrammar_ready()
+
+    import xgrammar as xgr
+    from grammargate.analyzer import analyze_schema
+
+    print(f"=== GrammarGate Real GPU Evaluation Runner (xgrammar {xgr.__version__}) ===")
     print(f"Target Model: {MODEL_ID}")
     print(f"Device: {DEVICE}")
     if torch.cuda.is_available():
@@ -313,7 +325,8 @@ def run_evaluation():
     model.eval()
     print(f"Model loaded into VRAM: {torch.cuda.memory_allocated(0)/(1024**2):.2f} MB")
 
-    tok_info = xgr.TokenizerInfo.from_huggingface(tokenizer)
+    vocab_size = int(getattr(model.config, "vocab_size", len(tokenizer)))
+    tok_info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
     compiler = xgr.GrammarCompiler(tok_info)
 
     results_traces = []
@@ -833,4 +846,8 @@ def run_evaluation():
 
 
 if __name__ == "__main__":
-    run_evaluation()
+    parser = argparse.ArgumentParser(description="GrammarGate Real GPU Evaluation Runner")
+    parser.add_argument("--require-native-l1", action="store_true", default=True, help="Fail loudly if native Rust grammargate_core is unavailable")
+    parser.add_argument("--require-xgrammar", action="store_true", default=True, help="Fail loudly if native xgrammar>=0.2.9 is unavailable")
+    args = parser.parse_args()
+    run_evaluation(require_native_l1=args.require_native_l1, require_xgrammar=args.require_xgrammar)

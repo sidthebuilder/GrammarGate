@@ -11,6 +11,10 @@ Computes:
 
 from __future__ import annotations
 import sys
+from pathlib import Path
+_ROOT = str(Path(__file__).resolve().parent.parent)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 sys.modules["torchvision"] = None
 
 import os
@@ -21,13 +25,12 @@ import argparse
 from typing import Any, Dict, List, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
-import xgrammar as xgr
 
 from grammargate.adapters.hf_processor import GrammarGateHfProcessor
-from grammargate.analyzer import analyze_schema
 from grammargate.escalator import RollingEscalator
 from grammargate.gate import GateConfig
 from grammargate.model_utils import resolve_model_path
+from grammargate.native_checks import assert_native_l1_ready, assert_xgrammar_ready
 from benchmarks.generators.dataset_generator import generate_full_benchmark
 
 
@@ -52,15 +55,24 @@ def evaluate_suite(
     device: str,
     checkpoint_path: str,
     max_new_tokens: int = 25,
+    require_native_l1: bool = True,
+    require_xgrammar: bool = True,
 ) -> List[Dict[str, Any]]:
     """Evaluates a list of benchmark tasks with GrammarGate on the target device."""
+    if require_native_l1:
+        assert_native_l1_ready()
+    if require_xgrammar:
+        assert_xgrammar_ready()
+
+    import xgrammar as xgr
+    from grammargate.analyzer import analyze_schema
+
     results = []
-    
-    # Initialize tokenizer compiler
-    tokenizer_info = xgr.TokenizerInfo(tokenizer)
+    vocab_size = int(getattr(model.config, "vocab_size", len(tokenizer)))
+    tokenizer_info = xgr.TokenizerInfo.from_huggingface(tokenizer, vocab_size=vocab_size)
     compiler = xgr.GrammarCompiler(tokenizer_info, max_threads=4)
 
-    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(checkpoint_path)), exist_ok=True)
     f_out = open(checkpoint_path, "a", encoding="utf-8")
 
     for idx, task in enumerate(tasks):
@@ -83,11 +95,11 @@ def evaluate_suite(
                 layer1_elevated = False
 
             matcher = xgr.GrammarMatcher(compiled_grammar)
-            bitmask_gpu = allocate_bitmask(matcher, device)
+            bitmask_cpu = xgr.allocate_token_bitmask(1, tokenizer_info.vocab_size)
 
             def bitmask_provider(step: int, vocab_size: int) -> torch.Tensor:
-                matcher.fill_next_token_bitmask(bitmask_gpu)
-                return bitmask_gpu
+                matcher.fill_next_token_bitmask(bitmask_cpu)
+                return bitmask_cpu
 
             escalator = RollingEscalator(tokenizer=tokenizer)
 
@@ -188,7 +200,7 @@ def print_statistical_summary(results: List[Dict[str, Any]]) -> None:
         successes = sum(1 for r in cat_res if r["passed"])
         rate = (successes / n) * 100.0
         low_ci, high_ci = wilson_score_interval(successes, n)
-        ci_str = f"[{low_ci*100.1:.1f}%, {high_ci*100.0:.1f}%]"
+        ci_str = f"[{low_ci*100.0:.1f}%, {high_ci*100.0:.1f}%]"
         avg_pure_gate = sum(r["pure_gate_ms_tok"] for r in cat_res) / n
 
         if cat == "benign":
@@ -208,7 +220,14 @@ def main() -> None:
     parser.add_argument("--samples-per-category", type=int, default=10, help="Number of samples per category (default: 10, max: 1000)")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--checkpoint", type=str, default="benchmarks/results_large_scale.jsonl")
+    parser.add_argument("--require-native-l1", action="store_true", default=True)
+    parser.add_argument("--require-xgrammar", action="store_true", default=True)
     args = parser.parse_args()
+
+    if args.require_native_l1:
+        assert_native_l1_ready()
+    if args.require_xgrammar:
+        assert_xgrammar_ready()
 
     model_path = resolve_model_path("Qwen/Qwen2.5-3B-Instruct", env_var="HF_MODEL_PATH_3B")
     print(f"Loading model: {model_path} on {args.device}...")
@@ -226,7 +245,15 @@ def main() -> None:
         all_tasks.extend(suite[cat])
 
     print(f"Starting evaluation of {len(all_tasks)} total tasks...")
-    results = evaluate_suite(model, tokenizer, all_tasks, args.device, args.checkpoint)
+    results = evaluate_suite(
+        model,
+        tokenizer,
+        all_tasks,
+        args.device,
+        args.checkpoint,
+        require_native_l1=args.require_native_l1,
+        require_xgrammar=args.require_xgrammar,
+    )
     print_statistical_summary(results)
 
 

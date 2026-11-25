@@ -17,9 +17,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-xgrammar = ["xgrammar>=0.1.30"]
-eval = ["xgrammar>=0.1.30", "numpy>=1.24.0"]
-dev = ["pytest>=8.0.0", "numpy>=1.24.0", "xgrammar>=0.1.30"]
+xgrammar = ["xgrammar>=0.2.9"]
+eval = ["xgrammar>=0.2.9", "numpy>=1.24.0"]
+dev = ["pytest>=8.0.0", "numpy>=1.24.0", "xgrammar>=0.2.9"]
 
 [tool.maturin]
 manifest-path = "grammargate_core/Cargo.toml"

@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_ref_indirection_and_unicode_escape_enum() {
-        let schema = r#"{
+        let schema = r##"{
             "$defs": {
                 "hidden": {
                     "type": "string",
@@ -254,7 +254,7 @@ mod tests {
                 "prefix": { "$ref": "#/$defs/hidden" }
             },
             "required": ["prefix"]
-        }"#;
+        }"##;
 
         let report = analyze_schema_impl(schema).expect("Failed to parse $ref schema");
         assert!(report.is_elevated, "$ref enum indirection must trigger elevated risk");
@@ -295,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_benign_multi_option_api_enums_vs_enum_attacks() {
-        let benign_ticket = r#"{
+        let benign_ticket = r##"{
             "$defs": {
                 "priority_enum": {"type": "string", "enum": ["p1", "p2", "p3", "p4"]}
             },
@@ -308,7 +308,7 @@ mod tests {
                 "summary": {"type": "string"}
             },
             "required": ["severity", "category", "http_status", "summary"]
-        }"#;
+        }"##;
 
         let benign_rep = analyze_schema_impl(benign_ticket).expect("Failed to parse benign API enum schema");
         assert!(!benign_rep.is_elevated, "Multi-option benign API enums must not be elevated");

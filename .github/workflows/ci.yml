@@ -40,7 +40,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install pytest xgrammar transformers numpy
+          pip install --upgrade pytest "xgrammar>=0.2.9" transformers numpy pydantic jsonschema
 
       - name: Run Python CPU-compatible unit and benchmark tests
         env:
@@ -48,6 +48,7 @@ jobs:
         run: |
           pytest tests/test_rust_core.py \
                  tests/test_rust_analyzer.py \
+                 tests/test_native_xgrammar_ci.py \
                  tests/test_logit_gate.py \
                  tests/test_escalator.py \
                  tests/test_vllm_adapter.py \

@@ -4,6 +4,7 @@ Measures p50, p95, and max execution overhead for Layer 1, Layer 2, and Layer 3.
 """
 
 from __future__ import annotations
+import argparse
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -15,6 +16,7 @@ import torch
 from grammargate.gate import PreMaskLogitGate, GateConfig
 from grammargate.bitmask_utils import pack_boolean_mask
 from grammargate.escalator import RollingEscalator
+from grammargate.native_checks import assert_native_l1_ready
 
 
 def _try_analyze_schema(schema):
@@ -132,12 +134,21 @@ def profile_layer3(iterations: int = 1000) -> dict[str, float]:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="GrammarGate Latency Profiler & Overhead Benchmark")
+    parser.add_argument("--require-native-l1", action="store_true", default=True, help="Fail loudly if Rust grammargate_core cannot load (default: enabled)")
+    parser.add_argument("--allow-skip-l1", action="store_true", help="Allow skipping Rust Layer 1 timing on restricted hosts")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("  GrammarGate Latency Profiler & Overhead Benchmark")
     print("=" * 60)
 
     device = get_safe_device()
     print(f"Device target for profiling: {device.type.upper()}")
+
+    require_l1 = args.require_native_l1 and not args.allow_skip_l1
+    if require_l1:
+        assert_native_l1_ready()
 
     l1 = None
     try:
@@ -147,6 +158,8 @@ def main():
         print(f"  p95 Overhead : {l1['p95_us']:.2f} microseconds  (Target: < 50.0 us)")
         print(f"  Max Overhead : {l1['max_us']:.2f} microseconds")
     except Exception as exc:
+        if require_l1:
+            raise
         print(f"\n[Layer 1: Static Control-Plane Analyzer] SKIPPED ({exc})")
 
     l2 = profile_layer2()
