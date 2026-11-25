@@ -104,6 +104,7 @@ class GrammarGateHfProcessor(LogitsProcessor):
                     token_id=last_token,
                     layer1_elevated=self.layer1_elevated,
                     layer2_killed_mass=self.last_decision.killed_mass if self.last_decision else 0.0,
+                    is_final=(last_token == self.eos_token_id),
                 )
                 self.pure_gate_time_sec += (time.perf_counter() - t_l3_0)
                 if esc_dec.aborted:
@@ -140,3 +141,25 @@ class GrammarGateHfProcessor(LogitsProcessor):
         self.step += 1
         self.total_gate_time_sec += (time.perf_counter() - t_start)
         return scores
+
+    def finalize(self, final_token_id: int | None = None):
+        """
+        Flushes Layer 3 inspection over trailing tokens after model.generate() completes,
+        ensuring tokens emitted between check_interval ticks cannot escape inspection.
+        """
+        if self.escalator is None or self.is_tripped:
+            return None
+        if final_token_id is not None and final_token_id != self.eos_token_id:
+            dec = self.escalator.step(
+                token_id=final_token_id,
+                layer1_elevated=self.layer1_elevated,
+                layer2_killed_mass=self.last_decision.killed_mass if self.last_decision else 0.0,
+                is_final=True,
+            )
+        else:
+            dec = self.escalator.finalize(layer1_elevated=self.layer1_elevated)
+        if dec.aborted:
+            self.is_tripped = True
+            self.trip_source = "L3"
+            self.trip_reason = dec.reason
+        return dec

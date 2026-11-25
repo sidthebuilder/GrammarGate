@@ -80,6 +80,9 @@ impl<'a> Parser<'a> {
         self.skip_whitespace();
         let val = self.parse_value()?;
         self.skip_whitespace();
+        if self.idx < self.chars.len() {
+            return Err(format!("Unexpected trailing content at pos {}", self.idx));
+        }
         Ok(val)
     }
 
@@ -164,6 +167,18 @@ impl<'a> Parser<'a> {
         Ok(JsonValue::Array(items))
     }
 
+    fn parse_hex4(&mut self) -> Result<u32, String> {
+        if self.idx + 4 > self.chars.len() {
+            return Err("Truncated \\u escape sequence".to_string());
+        }
+        let hex_str = std::str::from_utf8(&self.chars[self.idx..self.idx + 4])
+            .map_err(|e| e.to_string())?;
+        let val = u32::from_str_radix(hex_str, 16)
+            .map_err(|_| format!("Invalid hex escape '\\u{}'", hex_str))?;
+        self.idx += 4;
+        Ok(val)
+    }
+
     fn parse_string(&mut self) -> Result<String, String> {
         self.skip_whitespace();
         if self.idx >= self.chars.len() || self.chars[self.idx] != b'"' {
@@ -193,6 +208,31 @@ impl<'a> Parser<'a> {
                     b't' => s.push('\t'),
                     b'b' => s.push('\x08'),
                     b'f' => s.push('\x0C'),
+                    b'u' => {
+                        let code = self.parse_hex4()?;
+                        if (0xD800..=0xDBFF).contains(&code) {
+                            if self.idx + 1 < self.chars.len()
+                                && self.chars[self.idx] == b'\\'
+                                && self.chars[self.idx + 1] == b'u'
+                            {
+                                self.idx += 2;
+                                let low = self.parse_hex4()?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err("Invalid UTF-16 low surrogate".to_string());
+                                }
+                                let combined = 0x10000 + (((code - 0xD800) << 10) | (low - 0xDC00));
+                                let ch = char::from_u32(combined)
+                                    .ok_or_else(|| "Invalid surrogate scalar".to_string())?;
+                                s.push(ch);
+                            } else {
+                                return Err("Unpaired UTF-16 high surrogate".to_string());
+                            }
+                        } else {
+                            let ch = char::from_u32(code)
+                                .ok_or_else(|| "Invalid unicode scalar".to_string())?;
+                            s.push(ch);
+                        }
+                    }
                     _ => s.push(esc as char),
                 }
             } else {

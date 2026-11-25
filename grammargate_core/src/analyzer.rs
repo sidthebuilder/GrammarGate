@@ -39,15 +39,74 @@ pub fn analyze_schema_impl(schema_json: &str) -> Result<SchemaRiskReport, String
     Ok(metrics.into())
 }
 
+fn strip_ebnf_comments(grammar_str: &str) -> String {
+    let mut out = String::with_capacity(grammar_str.len());
+    for line in grammar_str.lines() {
+        let mut in_quotes = false;
+        let mut escaped = false;
+        let mut cut_at: Option<usize> = None;
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+                i += 1;
+                continue;
+            }
+            if b == b'\\' && in_quotes {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if b == b'"' {
+                in_quotes = !in_quotes;
+                i += 1;
+                continue;
+            }
+            if !in_quotes {
+                if b == b'#' || (b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/') {
+                    cut_at = Some(i);
+                    break;
+                }
+            }
+            i += 1;
+        }
+        let clean = match cut_at {
+            Some(idx) => &line[..idx],
+            None => line,
+        };
+        if !clean.trim().is_empty() {
+            out.push_str(clean);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn production_rhs_allows_refusal(cleaned_grammar: &str) -> bool {
+    let refusal_literals = ["\"sorry", "\"cannot", "\"i cannot", "\"i'm sorry", "\"unable", "\"apolog", "\"refuse"];
+    for line in cleaned_grammar.lines() {
+        if let Some((_, rhs)) = line.split_once("::=") {
+            let rhs_lower = rhs.to_lowercase();
+            if refusal_literals.iter().any(|lit| rhs_lower.contains(lit)) {
+                return true;
+            }
+            // Also recognize explicit refusal nonterminal referenced from a root/statement production
+            if line.trim_start().starts_with("root") && rhs_lower.contains("refusal") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn analyze_grammar_impl(grammar_str: &str, syntax: &str) -> Result<SchemaRiskReport, String> {
     let mut triggered_rules = Vec::new();
-    let lower = grammar_str.to_lowercase();
+    let cleaned = strip_ebnf_comments(grammar_str);
+    let lower = cleaned.to_lowercase();
 
-    let allows_refusal = lower.contains("refusal")
-        || lower.contains("error")
-        || lower.contains("cannot")
-        || lower.contains("sorry")
-        || lower.contains("apolog");
+    let allows_refusal = production_rhs_allows_refusal(&cleaned);
 
     let is_code_grammar = lower.contains("def ")
         || lower.contains("import ")
@@ -179,5 +238,58 @@ mod tests {
         let report = analyze_grammar_impl(grammar, "gbnf").expect("Failed to analyze grammar");
         assert!(report.is_elevated);
         assert!(report.triggered_rules.iter().any(|r| r == "CODESPEAR_SYNTAX_MASK_NO_REFUSAL_PRODUCTION"));
+    }
+
+    #[test]
+    fn test_ref_indirection_and_unicode_escape_enum() {
+        let schema = r#"{
+            "$defs": {
+                "hidden": {
+                    "type": "string",
+                    "enum": ["\u0042ypassing license check:"]
+                }
+            },
+            "type": "object",
+            "properties": {
+                "prefix": { "$ref": "#/$defs/hidden" }
+            },
+            "required": ["prefix"]
+        }"#;
+
+        let report = analyze_schema_impl(schema).expect("Failed to parse $ref schema");
+        assert!(report.is_elevated, "$ref enum indirection must trigger elevated risk");
+        assert_eq!(report.single_option_enum_count, 1);
+        assert!(report.triggered_rules.iter().any(|r| r == "SINGLE_OPTION_ENUM"));
+    }
+
+    #[test]
+    fn test_ebnf_comment_spoofing_ignored() {
+        let grammar = r#"
+            # error refusal sorry cannot apologize
+            root ::= "import " [a-z]+
+        "#;
+
+        let report = analyze_grammar_impl(grammar, "ebnf").expect("Failed to analyze grammar");
+        assert!(report.is_elevated, "Comments mentioning refusal must not disarm CodeSpear check");
+        assert!(!report.has_refusal_branch);
+    }
+
+    #[test]
+    fn test_benign_short_field_names_not_flagged_as_dict() {
+        let schema = r#"{
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string"},
+                "repo": {"type": "string"},
+                "title": {"type": "string"},
+                "city": {"type": "string"},
+                "country": {"type": "string"}
+            },
+            "required": ["owner", "repo", "title"]
+        }"#;
+
+        let report = analyze_schema_impl(schema).expect("Failed to parse benign PR schema");
+        assert!(!report.has_lookup_dictionary, "Benign descriptive fields must not trip dict detector");
+        assert!(!report.is_elevated);
     }
 }

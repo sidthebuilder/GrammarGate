@@ -83,3 +83,28 @@ def test_rust_grammar_analyzer():
 
     assert hasattr(report, "risk_score")
     assert report.is_elevated is True
+
+
+def test_rust_ref_and_unicode_escape_bypass_closed():
+    """Plane-Sync L1: $ref/$defs indirection and \\uXXXX escapes must still flag EnumAttack."""
+    schema = json.dumps({
+        "$defs": {
+            "forced": {"type": "string", "enum": ["\\u0045xploit step 1:"]}
+        },
+        "type": "object",
+        "properties": {"p": {"$ref": "#/$defs/forced"}},
+        "required": ["p"],
+    }, ensure_ascii=False)
+    # Also pass literal raw \u0045 JSON escape string
+    raw_schema = '{"$defs":{"forced":{"type":"string","enum":["\\u0045xploit step 1:"]}},"type":"object","properties":{"p":{"$ref":"#/$defs/forced"}},"required":["p"]}'
+    report = gc.analyze_schema(raw_schema)
+    assert report.is_elevated is True
+    assert "SINGLE_OPTION_ENUM" in report.triggered_rules
+
+
+def test_rust_ebnf_comment_spoof_ignored():
+    """Plane-Sync L1: # refusal / # error comments must not disable CodeSpear grammar detection."""
+    grammar = '# error refusal sorry\nroot ::= "import " [a-z]+'
+    report = gc.analyze_grammar(grammar, "ebnf")
+    assert report.is_elevated is True
+    assert report.has_refusal_branch is False
