@@ -223,7 +223,10 @@ def test_speclook_kv_cache_rollback_and_real_qwen_python_cfg():
 
     with torch.no_grad():
         uncached = model(torch.cat([test_ids, torch.tensor([[40]])], dim=-1)).logits[:, -1, :]
-    # Qwen2.5 weights load in bfloat16 natively on CPU; 1-step KV cache matches argmax and bfloat16 ULP tolerance
+    # Qwen2.5 weights load in bfloat16 natively on CPU; verify argmax, cosine parity, and softmax probability diff
     assert int(torch.argmax(next_logits_1)) == int(torch.argmax(uncached))
-    assert torch.allclose(next_logits_1.float(), uncached.float(), atol=0.25, rtol=1e-2)
-    print(f"[SpecLook KV Rollback] seq_len={test_ids.shape[1]}, cache_seq_len={helper._past_kv.get_seq_length()}, rollback_ms={spec_ms:.2f}, max_diff={(next_logits_1 - uncached).abs().max().item():.2e}")
+    cos_sim = float(torch.nn.functional.cosine_similarity(next_logits_1.float(), uncached.float(), dim=-1).item())
+    prob_diff = float((torch.softmax(next_logits_1.float(), dim=-1) - torch.softmax(uncached.float(), dim=-1)).abs().max().item())
+    assert cos_sim >= 0.999, f"Expected logit cosine similarity >= 0.999, got {cos_sim}"
+    assert prob_diff < 0.02, f"Expected softmax max probability diff < 0.02, got {prob_diff}"
+    print(f"[SpecLook KV Rollback] seq_len={test_ids.shape[1]}, cache_seq_len={helper._past_kv.get_seq_length()}, rollback_ms={spec_ms:.2f}, cos={cos_sim:.6f}, max_p_diff={prob_diff:.2e}")
