@@ -23,6 +23,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "GrammarGateVllmV1Processor": ("grammargate.adapters.vllm_processor", "GrammarGateVllmV1Processor"),
     "GrammarGateVllmSlotManager": ("grammargate.adapters.vllm_processor", "GrammarGateVllmSlotManager"),
     "GateAuditRecord": ("grammargate.telemetry", "GateAuditRecord"),
+    "HiddenStateRefusalProbe": ("grammargate.hs_probe", "HiddenStateRefusalProbe"),
+    "ProbeConfig": ("grammargate.hs_probe", "ProbeConfig"),
+    "MaskDivergenceDecision": ("grammargate.hs_probe", "MaskDivergenceDecision"),
 }
 
 __all__ = list(_LAZY_EXPORTS.keys())

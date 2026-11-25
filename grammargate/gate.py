@@ -25,6 +25,8 @@ class GateConfig:
     ambiguous_onset_threshold: float = 0.01
     speculative_confirm_threshold: float = 0.12
     benign_transition_margin: float = 0.10
+    # HS-Gate configuration (Mechanism 2)
+    use_hs_gate: bool = False
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,9 @@ class GateDecision:
     speculative_checked: bool = False
     speculative_confirmed_mass: float = 0.0
     speculative_latency_ms: float = 0.0
+    hs_score: float | None = None
+    hs_quadrant: str | None = None
+    hs_escalate_l3: bool = False
 
     def __repr__(self) -> str:
         return (
@@ -111,6 +116,8 @@ class PreMaskLogitGate:
         logits: torch.Tensor,
         bitmask: torch.Tensor,
         lookahead_logits_fn: Callable[[int], torch.Tensor] | None = None,
+        hs_probe: Any = None,
+        hidden_vec: torch.Tensor | None = None,
     ) -> GateDecision:
         """
         Inspects pre-mask logits alongside the candidate grammar bitmask.
@@ -226,6 +233,29 @@ class PreMaskLogitGate:
                     f"KILLED_MASS_TOP1_OVERRIDE (killed_mass={km:.3f}, top1_shift={trs} ranks, refusal_suppression={rs:.4f})"
                 )
 
+        # Mechanism 2: HS-Gate Mask-Divergence Gating (overrides prose/speculative false trips when
+        # residual stream confirms benign intent, and blocks high-clip + high-HS or mid-stream DictAttack)
+        hs_score_val: float | None = None
+        hs_quadrant: str | None = None
+        hs_escalate_l3 = False
+        if self.config.use_hs_gate and hs_probe is not None:
+            hs_score_val = float(hs_probe.score(hidden_vec))
+            div_dec = hs_probe.classify_mask_divergence(
+                hs_score=hs_score_val,
+                killed_mass=km,
+                strict_refusal_suppression=strict_rs,
+                ambiguous_refusal_suppression=ambig_rs,
+                top1_rank_shift=trs,
+                top1_shift_threshold=self.config.top1_shift_threshold,
+            )
+            hs_quadrant = div_dec.quadrant
+            hs_escalate_l3 = div_dec.should_escalate_l3
+            if div_dec.quadrant == "HIGH_CLIP_LOW_HS":
+                # Benign prose/formatting suppression confirmed by frozen residual stream
+                tripped_reasons = []
+            elif div_dec.should_block and div_dec.reason is not None:
+                tripped_reasons.append(div_dec.reason)
+
         return GateDecision(
             should_trip=(len(tripped_reasons) > 0),
             killed_mass=km,
@@ -238,6 +268,9 @@ class PreMaskLogitGate:
             speculative_checked=spec_checked,
             speculative_confirmed_mass=spec_confirmed_mass,
             speculative_latency_ms=spec_latency_ms,
+            hs_score=hs_score_val,
+            hs_quadrant=hs_quadrant,
+            hs_escalate_l3=hs_escalate_l3,
         )
 
     def apply_safe_escape(self, logits: torch.Tensor, eos_token_id: int | None = None) -> torch.Tensor:

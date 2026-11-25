@@ -80,6 +80,7 @@ class GrammarGateHfProcessor(LogitsProcessor):
         layer1_elevated: bool = False,
         lookahead_model: Any = None,
         lookahead_fn: Callable[[torch.LongTensor, int], torch.Tensor] | None = None,
+        hs_probe: Any = None,
     ):
         """
         Parameters:
@@ -92,6 +93,7 @@ class GrammarGateHfProcessor(LogitsProcessor):
             layer1_elevated: Boolean indicating elevated Layer 1 schema rigidity.
             lookahead_model: Optional HF causal LM for SpecLook KV-cached 2-token checks.
             lookahead_fn: Optional callback (input_ids, onset_token_id) -> next_logits.
+            hs_probe: Optional HiddenStateRefusalProbe (HS-Gate) attached to the model.
         """
         super().__init__()
         self.tokenizer = tokenizer
@@ -102,6 +104,8 @@ class GrammarGateHfProcessor(LogitsProcessor):
         self.layer1_elevated = layer1_elevated
         self._lookahead_helper = CachedPrefixLookahead(lookahead_model) if lookahead_model is not None else None
         self.lookahead_fn = lookahead_fn
+        self.hs_probe = hs_probe
+        self.hs_scores: list[float] = []
         self.pure_gate_time_sec: float = 0.0
         self.total_gate_time_sec: float = 0.0
         self.speculative_time_sec: float = 0.0
@@ -167,9 +171,10 @@ class GrammarGateHfProcessor(LogitsProcessor):
             # Layer 3: Rolling Escalator check
             if self.escalator is not None:
                 t_l3_0 = time.perf_counter()
+                l1_or_hs = self.layer1_elevated or bool(self.last_decision and self.last_decision.hs_escalate_l3)
                 esc_dec = self.escalator.step(
                     token_id=last_token,
-                    layer1_elevated=self.layer1_elevated,
+                    layer1_elevated=l1_or_hs,
                     layer2_killed_mass=self.last_decision.killed_mass if self.last_decision else 0.0,
                     is_final=(last_token == self.eos_token_id),
                 )
@@ -192,11 +197,24 @@ class GrammarGateHfProcessor(LogitsProcessor):
             if self.lookahead_fn is not None:
                 step_lookahead = lambda tok_id: self.lookahead_fn(input_ids, tok_id)
             elif self._lookahead_helper is not None:
-                step_lookahead = lambda tok_id: self._lookahead_helper.step_logits(input_ids, tok_id)
+                if self.hs_probe is not None:
+                    def _paused_lookahead(tok_id: int) -> torch.Tensor:
+                        with self.hs_probe.pause():
+                            return self._lookahead_helper.step_logits(input_ids, tok_id)
+                    step_lookahead = _paused_lookahead
+                else:
+                    step_lookahead = lambda tok_id: self._lookahead_helper.step_logits(input_ids, tok_id)
 
         t_pure_0 = time.perf_counter()
-        decision = self.gate.inspect_pre_mask(scores, valid_mask, lookahead_logits_fn=step_lookahead)
+        decision = self.gate.inspect_pre_mask(
+            scores,
+            valid_mask,
+            lookahead_logits_fn=step_lookahead,
+            hs_probe=self.hs_probe,
+        )
         self.pure_gate_time_sec += (time.perf_counter() - t_pure_0)
+        if decision.hs_score is not None:
+            self.hs_scores.append(decision.hs_score)
         if decision.speculative_checked:
             self.speculative_checks += 1
             self.speculative_time_sec += decision.speculative_latency_ms / 1000.0
