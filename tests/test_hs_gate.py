@@ -10,6 +10,7 @@ Verifies:
 from __future__ import annotations
 import os
 import time
+from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
 
@@ -118,10 +119,13 @@ def test_hs_gate_real_qwen_calibration_sensitivity_and_dictattack_midstream():
     2) Step-0 vs. mid-generation DictAttack leaf-value residual projections.
     3) End-to-end Mask-Divergence gating overhead (< 1 ms/tok) and zero benign Python CFG false trips.
     """
-    os.environ["HF_HOME"] = r"D:\New final\hf_cache"
+    _local_hf = Path(__file__).resolve().parent.parent / "hf_cache"
+    if _local_hf.is_dir():
+        os.environ.setdefault("HF_HOME", str(_local_hf))
     model_path = resolve_model_path("Qwen/Qwen2.5-0.5B-Instruct")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-    model = AutoModelForCausalLM.from_pretrained(model_path, local_files_only=True)
+    is_local = os.path.isdir(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=is_local)
+    model = AutoModelForCausalLM.from_pretrained(model_path, local_files_only=is_local)
     model.eval()
 
     heldout_harm = [
@@ -239,3 +243,26 @@ def test_hs_gate_real_qwen_calibration_sensitivity_and_dictattack_midstream():
         print(f"[HS-Gate Benign Generation] steps={proc.step}, hs_scores={[round(x, 3) for x in proc.hs_scores]}, probe_overhead={probe_ms_tok:.4f} ms/tok")
     finally:
         handle.remove()
+
+
+def test_multilingual_calibration_mode_and_chat_template_helpers():
+    from grammargate.hs_probe import (
+        DEFAULT_MULTILINGUAL_CALIBRATION_BENIGN,
+        DEFAULT_MULTILINGUAL_CALIBRATION_HARMFUL,
+        format_chat_prompt,
+    )
+
+    assert len(DEFAULT_MULTILINGUAL_CALIBRATION_HARMFUL) == 20
+    assert len(DEFAULT_MULTILINGUAL_CALIBRATION_BENIGN) == 20
+    assert set(DEFAULT_MULTILINGUAL_CALIBRATION_HARMFUL).isdisjoint(set(DEFAULT_MULTILINGUAL_CALIBRATION_BENIGN))
+
+    class _FakeLlamaTokenizer:
+        chat_template = "{% for m in messages %}<|start_header_id|>{{ m['role'] }}{% endfor %}"
+
+        def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True):
+            return f"<|start_header_id|>user<|end_header_id|>\n{msgs[0]['content']}<|eot_id|>"
+
+    formatted_llama = format_chat_prompt("Hello", tokenizer=_FakeLlamaTokenizer())
+    assert formatted_llama.startswith("<|start_header_id|>user")
+    formatted_qwen = format_chat_prompt("Hello", tokenizer=None)
+    assert formatted_qwen.startswith("<|im_start|>user\nHello")

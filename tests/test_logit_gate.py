@@ -132,6 +132,7 @@ def test_sparse_gate_matches_dense_and_tracks_benign_telemetry():
     """Verifies cached sparse refusal reduction matches dense softmax and HF processor logs symmetric max_*."""
     from grammargate.adapters.hf_processor import GrammarGateHfProcessor
 
+    torch.manual_seed(0)
     vocab_size = 512
     ref_mask = torch.zeros(vocab_size, dtype=torch.bool)
     ref_mask[[10, 20, 30]] = True
@@ -164,7 +165,8 @@ def test_sparse_gate_matches_dense_and_tracks_benign_telemetry():
         config=GateConfig(refusal_suppression_threshold=0.99, killed_mass_threshold=0.99),
     )
     out = proc(torch.tensor([[100]]), logits.clone())
+    expected_proc_rs = float(P[[10, 11]].sum().item())
     assert proc.is_tripped is False
-    assert proc.max_refusal_suppression >= expected_rs - 1e-5
-    assert proc.max_killed_mass >= expected_km - 1e-5
+    assert abs(proc.max_refusal_suppression - expected_proc_rs) < 1e-5
+    assert abs(proc.max_killed_mass - expected_km) < 1e-5
     assert torch.isneginf(out[0, 10])

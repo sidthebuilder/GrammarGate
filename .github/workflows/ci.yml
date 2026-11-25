@@ -25,16 +25,22 @@ jobs:
 
       - name: Build and test Rust core
         run: |
-          cargo test --verbose
-          cargo build --release --verbose
+          cargo test --manifest-path grammargate_core/Cargo.toml --verbose
+          cargo build --release --manifest-path grammargate_core/Cargo.toml --verbose
           mkdir -p grammargate_core
           find target -name "libgrammargate_core.so" -exec cp {} grammargate_core/ \;
+
+      - name: Cache Hugging Face Hub models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: ${{ runner.os }}-hf-qwen05b-${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install pytest xgrammar transformers
+          pip install pytest xgrammar transformers numpy
 
       - name: Run Python CPU-compatible unit and benchmark tests
         env:
@@ -45,6 +51,9 @@ jobs:
                  tests/test_logit_gate.py \
                  tests/test_escalator.py \
                  tests/test_vllm_adapter.py \
+                 tests/test_speclook_gate.py \
+                 tests/test_hs_gate.py \
+                 tests/test_ablation_runner.py \
                  benchmarks/attacks/ \
                  benchmarks/utility/ \
                  -v

@@ -7,6 +7,7 @@ KV-cache rollback integrity, trigger rate logging, and FPR reduction on Qwen2.5-
 from __future__ import annotations
 import os
 import time
+from pathlib import Path
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
 
@@ -127,10 +128,13 @@ def test_speclook_kv_cache_rollback_and_real_qwen_python_cfg():
     Runs real cached Qwen2.5-0.5B-Instruct on strict raw Python CFG bitmasks without xgrammar,
     verifying KV rollback preserves sequence length and measuring trigger rate, latency, and FPR.
     """
-    os.environ["HF_HOME"] = r"D:\New final\hf_cache"
+    _local_hf = Path(__file__).resolve().parent.parent / "hf_cache"
+    if _local_hf.is_dir():
+        os.environ.setdefault("HF_HOME", str(_local_hf))
     model_path = resolve_model_path("Qwen/Qwen2.5-0.5B-Instruct")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-    model = AutoModelForCausalLM.from_pretrained(model_path, local_files_only=True)
+    is_local = os.path.isdir(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=is_local)
+    model = AutoModelForCausalLM.from_pretrained(model_path, local_files_only=is_local)
     model.eval()
 
     # Allowed token mask mimicking strict Python-only tokens ('import', 'def', identifiers, '\n', ' ')
