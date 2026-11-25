@@ -126,3 +126,45 @@ def test_safe_escape_application():
 
     assert torch.isneginf(escaped[0]), "Non-EOS tokens must be -inf"
     assert escaped[eos_id].item() == 0.0, "EOS token must be 0.0"
+
+
+def test_sparse_gate_matches_dense_and_tracks_benign_telemetry():
+    """Verifies cached sparse refusal reduction matches dense softmax and HF processor logs symmetric max_*."""
+    from grammargate.adapters.hf_processor import GrammarGateHfProcessor
+
+    vocab_size = 512
+    ref_mask = torch.zeros(vocab_size, dtype=torch.bool)
+    ref_mask[[10, 20, 30]] = True
+    valid = torch.zeros(vocab_size, dtype=torch.bool)
+    valid[100:250] = True
+    valid[20] = True  # one allowed, two disallowed
+
+    logits = torch.randn((1, vocab_size))
+    logits[0, 10] = 3.0
+    logits[0, 100] = 4.0
+
+    gate = PreMaskLogitGate(refusal_mask=ref_mask, config=GateConfig(refusal_suppression_threshold=0.99), vocab_size=vocab_size)
+    dec = gate.inspect_pre_mask(logits, pack_boolean_mask(valid))
+
+    P = torch.softmax(logits[0].float(), dim=-1)
+    expected_km = float((1.0 - P[valid].sum()).item())
+    expected_rs = float(P[[10, 30]].sum().item())
+    assert abs(dec.killed_mass - expected_km) < 1e-5
+    assert abs(dec.refusal_suppression - expected_rs) < 1e-5
+
+    class TinyTok:
+        vocab_size = 512
+        eos_token_id = 0
+        def encode(self, text, add_special_tokens=False):
+            return [10] if "Sorry" in text else [11]
+
+    proc = GrammarGateHfProcessor(
+        tokenizer=TinyTok(),
+        bitmask_provider=lambda s, vs: pack_boolean_mask(valid),
+        config=GateConfig(refusal_suppression_threshold=0.99, killed_mass_threshold=0.99),
+    )
+    out = proc(torch.tensor([[100]]), logits.clone())
+    assert proc.is_tripped is False
+    assert proc.max_refusal_suppression >= expected_rs - 1e-5
+    assert proc.max_killed_mass >= expected_km - 1e-5
+    assert torch.isneginf(out[0, 10])

@@ -92,6 +92,13 @@ class PreMaskLogitGate:
         else:
             self.refusal_mask = None
 
+        self._cache_key: tuple[int, torch.device] | None = None
+        self._has_refusal_tokens: bool = False
+        self._ref_indices: torch.Tensor | None = None
+        self._strict_indices: torch.Tensor | None = None
+        self._ambig_indices: torch.Tensor | None = None
+        self._benign_indices: torch.Tensor | None = None
+
     def _align_mask(self, mask: torch.Tensor | None, vocab_size: int, device: torch.device) -> torch.Tensor:
         if mask is None:
             return torch.zeros(vocab_size, dtype=torch.bool, device=device)
@@ -111,6 +118,24 @@ class PreMaskLogitGate:
             self.refusal_mask = self._align_mask(self.refusal_mask, vocab_size, device)
         return self.refusal_mask
 
+    def _ensure_index_cache(self, vocab_size: int, device: torch.device) -> None:
+        key = (vocab_size, device)
+        if self._cache_key == key:
+            return
+        ref_mask = self._ensure_refusal_mask(vocab_size, device)
+        self._ref_indices = torch.nonzero(ref_mask, as_tuple=True)[0]
+        self._has_refusal_tokens = bool(self._ref_indices.numel() > 0)
+        if self.strict_refusal_mask is not None:
+            self.strict_refusal_mask = self._align_mask(self.strict_refusal_mask, vocab_size, device)
+            self._strict_indices = torch.nonzero(self.strict_refusal_mask, as_tuple=True)[0]
+        if self.ambiguous_onset_mask is not None:
+            self.ambiguous_onset_mask = self._align_mask(self.ambiguous_onset_mask, vocab_size, device)
+            self._ambig_indices = torch.nonzero(self.ambiguous_onset_mask, as_tuple=True)[0]
+        if self.benign_transition_mask is not None:
+            self.benign_transition_mask = self._align_mask(self.benign_transition_mask, vocab_size, device)
+            self._benign_indices = torch.nonzero(self.benign_transition_mask, as_tuple=True)[0]
+        self._cache_key = key
+
     def inspect_pre_mask(
         self,
         logits: torch.Tensor,
@@ -120,62 +145,109 @@ class PreMaskLogitGate:
         hidden_vec: torch.Tensor | None = None,
     ) -> GateDecision:
         """
-        Inspects pre-mask logits alongside the candidate grammar bitmask.
-        When config.use_speclook is enabled with strict/ambiguous masks, separates
-        unambiguous refusal spikes from overloaded unigram prose onsets ('I', 'It', 'As')
-        via a targeted 1-token continuation check.
+        Inspects pre-mask logits alongside the candidate grammar bitmask using a
+        single-softmax, sparse-index, single-host-sync pipeline.
         """
         is_1d = (logits.ndim == 1)
         logits_batch = logits.unsqueeze(0) if is_1d else logits
-        batch_size, vocab_size = logits_batch.shape
+        _, vocab_size = logits_batch.shape
+        device = logits_batch.device
 
-        if not torch.isfinite(logits_batch).any():
+        valid_mask = unpack_bitmask(bitmask, vocab_size, target_device=device)
+        if valid_mask.shape[-1] < vocab_size:
+            pad = torch.zeros((valid_mask.shape[0], vocab_size - valid_mask.shape[-1]), dtype=torch.bool, device=device)
+            valid_mask = torch.cat([valid_mask, pad], dim=-1)
+        elif valid_mask.shape[-1] > vocab_size:
+            valid_mask = valid_mask[:, :vocab_size]
+
+        self._ensure_index_cache(vocab_size, device)
+        logits_f = logits_batch if logits_batch.dtype == torch.float32 else logits_batch.float()
+        has_finite_t = torch.isfinite(logits_f).any()
+
+        # Single full-vocab softmax shared across killed_mass, refusal_suppression, and SpecLook sparse indices
+        P_pre = torch.softmax(logits_f, dim=-1)
+        zero_f = torch.zeros((), device=device, dtype=torch.float32)
+        valid_mass_t = torch.where(valid_mask, P_pre, zero_f).sum(dim=-1)[0]
+        km_t = (1.0 - valid_mass_t).clamp(min=0.0, max=1.0)
+
+        v0 = valid_mask[0]
+        p0 = P_pre[0]
+
+        if self._ref_indices is not None and self._ref_indices.numel() > 0:
+            rs_t = (p0[self._ref_indices] * (~v0[self._ref_indices])).sum()
+        else:
+            rs_t = zero_f
+
+        top1_pre = torch.argmax(logits_f[0])
+        top1_is_valid = v0[top1_pre]
+        top_valid_logit = logits_f[0].masked_fill(~v0, -float("inf")).max()
+        trs_t = torch.where(top1_is_valid, zero_f, (logits_f[0] > top_valid_logit).sum().float())
+
+        use_speclook_path = (
+            self.config.use_speclook
+            and self._strict_indices is not None
+            and self._ambig_indices is not None
+        )
+
+        if use_speclook_path:
+            strict_rs_t = (
+                (p0[self._strict_indices] * (~v0[self._strict_indices])).sum()
+                if self._strict_indices.numel() > 0
+                else zero_f
+            )
+            if self._ambig_indices.numel() > 0:
+                ambig_sup_vec = p0[self._ambig_indices] * (~v0[self._ambig_indices])
+                ambig_rs_t = ambig_sup_vec.sum()
+                local_max_idx = torch.argmax(ambig_sup_vec)
+                top_ambig_id_t = self._ambig_indices[local_max_idx].float()
+                top_ambig_prob_t = p0[self._ambig_indices[local_max_idx]]
+            else:
+                ambig_rs_t = zero_f
+                top_ambig_id_t = zero_f
+                top_ambig_prob_t = zero_f
+            benign_ts_t = (
+                (p0[self._benign_indices] * (~v0[self._benign_indices])).sum()
+                if (self._benign_indices is not None and self._benign_indices.numel() > 0)
+                else zero_f
+            )
+
+            # Single GPU->CPU transfer for all scalars
+            vals = torch.stack([
+                has_finite_t.float(),
+                km_t,
+                rs_t,
+                trs_t,
+                strict_rs_t,
+                ambig_rs_t,
+                benign_ts_t,
+                top_ambig_id_t,
+                top_ambig_prob_t,
+            ]).tolist()
+            has_finite, km, rs, trs_f, strict_rs, ambig_rs, benign_ts, top_ambig_id_f, top_ambig_prob = vals
+            top_ambig_id = int(top_ambig_id_f)
+        else:
+            # Single GPU->CPU transfer for legacy path
+            vals = torch.stack([has_finite_t.float(), km_t, rs_t, trs_t]).tolist()
+            has_finite, km, rs, trs_f = vals
+            strict_rs = rs
+            ambig_rs = 0.0
+            benign_ts = 0.0
+            top_ambig_id = 0
+            top_ambig_prob = 0.0
+
+        if has_finite < 0.5:
             raise ValueError(
                 "Invariant violation: Logits passed to GrammarGate appear to be already post-masked (-inf everywhere)."
             )
 
-        valid_mask = unpack_bitmask(bitmask, vocab_size)
-        if valid_mask.device != logits_batch.device:
-            valid_mask = valid_mask.to(logits_batch.device)
-        if valid_mask.ndim == 1:
-            valid_mask = valid_mask.unsqueeze(0)
-
-        ref_mask = self._ensure_refusal_mask(vocab_size, logits_batch.device)
-        killed_masses, refusal_suppressions, top1_rank_shifts = compute_metrics_vectorized(
-            logits_batch, valid_mask, ref_mask
-        )
-
-        km = float(killed_masses[0].item())
-        rs = float(refusal_suppressions[0].item())
-        trs = int(top1_rank_shifts[0].item())
+        trs = int(trs_f)
         tripped_reasons: list[str] = []
-        has_refusal_tokens = bool(ref_mask.any().item())
-
-        strict_rs = rs
-        ambig_rs = 0.0
-        benign_ts = 0.0
+        has_refusal_tokens = self._has_refusal_tokens
         spec_checked = False
         spec_confirmed_mass = 0.0
         spec_latency_ms = 0.0
 
-        use_speclook_path = (
-            self.config.use_speclook
-            and self.strict_refusal_mask is not None
-            and self.ambiguous_onset_mask is not None
-        )
-
         if use_speclook_path:
-            P_pre = torch.softmax(logits_batch[0].float(), dim=-1)
-            disallowed = ~valid_mask[0, :vocab_size]
-            strict_mask = self._align_mask(self.strict_refusal_mask, vocab_size, logits_batch.device)
-            ambig_mask = self._align_mask(self.ambiguous_onset_mask, vocab_size, logits_batch.device)
-            benign_mask = self._align_mask(self.benign_transition_mask, vocab_size, logits_batch.device)
-
-            strict_rs = float((P_pre * (strict_mask & disallowed).float()).sum().item())
-            ambig_suppressed = P_pre * (ambig_mask & disallowed).float()
-            ambig_rs = float(ambig_suppressed.sum().item())
-            benign_ts = float((P_pre * (benign_mask & disallowed).float()).sum().item())
-
             if strict_rs >= self.config.strict_refusal_threshold:
                 tripped_reasons.append(
                     f"STRICT_REFUSAL_SUPPRESSION (strict={strict_rs:.4f} >= {self.config.strict_refusal_threshold})"
@@ -185,9 +257,6 @@ class PreMaskLogitGate:
                 and lookahead_logits_fn is not None
                 and ambig_rs >= (benign_ts * self.config.benign_transition_margin)
             ):
-                # Trigger targeted 1-token speculative continuation check only on top ambiguous onset
-                top_ambig_id = int(torch.argmax(ambig_suppressed).item())
-                top_ambig_prob = float(P_pre[top_ambig_id].item())
                 t_spec0 = time.perf_counter()
                 next_logits = lookahead_logits_fn(top_ambig_id)
                 spec_latency_ms = (time.perf_counter() - t_spec0) * 1000.0
@@ -208,7 +277,6 @@ class PreMaskLogitGate:
                             f"SPECLOOK_CONFIRMED_REFUSAL (onset={top_ambig_id}, P(cont|onset)={cond_ref_prob:.3f}, joint={joint_ref_prob:.4f})"
                         )
 
-            # Still guard against extreme structural top-1 override ONLY when strict refusal > 0 or refusal corroborated
             if (
                 strict_rs >= (self.config.strict_refusal_threshold / 2.0)
                 and km >= self.config.killed_mass_threshold
@@ -218,7 +286,6 @@ class PreMaskLogitGate:
                     f"KILLED_MASS_TOP1_OVERRIDE (killed_mass={km:.3f}, top1_shift={trs}, strict={strict_rs:.4f})"
                 )
         else:
-            # Legacy Layer 2 rule set
             if rs >= self.config.refusal_suppression_threshold:
                 tripped_reasons.append(
                     f"REFUSAL_TOKEN_SUPPRESSION (suppressed={rs:.3f} >= threshold={self.config.refusal_suppression_threshold})"

@@ -144,8 +144,13 @@ class GrammarGateHfProcessor(LogitsProcessor):
         self.trip_source: str | None = None
         self.trip_reasons: list[str] = []
         self.trip_reason: str | None = None
+        self.trip_step: int | None = None
         self.last_decision: GateDecision | None = None
         self.trip_history: list[GateDecision] = []
+        self.max_killed_mass: float = 0.0
+        self.max_refusal_suppression: float = 0.0
+        self.max_top1_rank_shift: int = 0
+        self.max_hs_score: float | None = None
 
     @property
     def speculative_trigger_rate(self) -> float:
@@ -215,17 +220,26 @@ class GrammarGateHfProcessor(LogitsProcessor):
         self.pure_gate_time_sec += (time.perf_counter() - t_pure_0)
         if decision.hs_score is not None:
             self.hs_scores.append(decision.hs_score)
+            if self.max_hs_score is None or decision.hs_score > self.max_hs_score:
+                self.max_hs_score = decision.hs_score
         if decision.speculative_checked:
             self.speculative_checks += 1
             self.speculative_time_sec += decision.speculative_latency_ms / 1000.0
             if decision.should_trip:
                 self.speculative_confirmed_count += 1
         self.last_decision = decision
+        if decision.killed_mass > self.max_killed_mass:
+            self.max_killed_mass = decision.killed_mass
+        if decision.refusal_suppression > self.max_refusal_suppression:
+            self.max_refusal_suppression = decision.refusal_suppression
+        if decision.top1_rank_shift > self.max_top1_rank_shift:
+            self.max_top1_rank_shift = decision.top1_rank_shift
 
         # 3. Handle gate trip (CDA detected)
         if decision.should_trip:
             self.is_tripped = True
             self.trip_source = "L2"
+            self.trip_step = self.step
             self.trip_reasons = decision.tripped_reasons
             self.trip_history.append(decision)
             res = self.gate.apply_safe_escape(scores, self.eos_token_id)
@@ -233,7 +247,7 @@ class GrammarGateHfProcessor(LogitsProcessor):
             return res
 
         # 4. Apply bitmask in-place if safe (reusing unpacked valid_mask)
-        scores[~valid_mask] = -float("inf")
+        scores.masked_fill_(~valid_mask, -float("inf"))
 
         self.step += 1
         self.total_gate_time_sec += (time.perf_counter() - t_start)

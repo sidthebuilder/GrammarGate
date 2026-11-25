@@ -7,23 +7,44 @@ import math
 import torch
 
 
+_SHIFTS_CACHE: dict[torch.device, torch.Tensor] = {}
+_ZERO_FLOAT_CACHE: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+
+
+def _get_shifts(device: torch.device) -> torch.Tensor:
+    cached = _SHIFTS_CACHE.get(device)
+    if cached is None:
+        cached = torch.arange(32, device=device, dtype=torch.int32)
+        _SHIFTS_CACHE[device] = cached
+    return cached
+
+
+def _get_zero(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = (device, dtype)
+    cached = _ZERO_FLOAT_CACHE.get(key)
+    if cached is None:
+        cached = torch.tensor(0.0, device=device, dtype=dtype)
+        _ZERO_FLOAT_CACHE[key] = cached
+    return cached
+
+
 def unpack_bitmask(bitmask: torch.Tensor, vocab_size: int, target_device: torch.device | str | None = None) -> torch.Tensor:
     """
     Unpacks an XGrammar uint32/int32 packed bitmask into a boolean tensor of shape (batch_size, vocab_size).
     Bit k is 1 if token k is allowed, 0 if disallowed.
-    Optionally unpacks directly on target_device (e.g. CUDA) to eliminate CPU unpack and transfer latency.
+    Uses cached bit-shift vectors per device to avoid per-step allocations.
     """
     if bitmask.dtype == torch.bool:
         res = bitmask[..., :vocab_size] if bitmask.shape[-1] != vocab_size else bitmask
+        if res.ndim == 1:
+            res = res.unsqueeze(0)
         if target_device is not None and res.device != torch.device(target_device):
             res = res.to(target_device)
         return res
 
-    # If bitmask is packed 32-bit integers
     batch_size = bitmask.shape[0] if bitmask.ndim > 1 else 1
     flat_bitmask = bitmask.view(batch_size, -1)
 
-    # Number of 32-bit words needed
     words_needed = math.ceil(vocab_size / 32)
     flat_bitmask = flat_bitmask[:, :words_needed]
 
@@ -31,9 +52,7 @@ def unpack_bitmask(bitmask: torch.Tensor, vocab_size: int, target_device: torch.
     if target != flat_bitmask.device:
         flat_bitmask = flat_bitmask.to(target, non_blocking=True)
 
-    # Unpack bits: each int32/uint32 expands to 32 booleans
-    # Using bitwise shifts on target device
-    shifts = torch.arange(32, device=target, dtype=torch.int32)
+    shifts = _get_shifts(target)
     unpacked = (flat_bitmask.unsqueeze(-1) >> shifts) & 1
     unpacked_bool = (unpacked != 0).reshape(batch_size, -1)
 
@@ -71,7 +90,7 @@ def pack_boolean_mask(valid_mask: torch.Tensor) -> torch.Tensor:
         padded_mask = valid_mask
 
     chunks = padded_mask.view(batch_size, words_needed, 32).to(torch.int32)
-    shifts = torch.arange(32, device=valid_mask.device, dtype=torch.int32)
+    shifts = _get_shifts(valid_mask.device)
     packed = (chunks << shifts).sum(dim=-1).to(torch.int32)
     return packed
 
@@ -80,15 +99,13 @@ def compute_metrics_vectorized(
     logits: torch.Tensor,
     valid_mask: torch.Tensor,
     refusal_mask: torch.Tensor,
+    refusal_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Computes pre-mask logit metrics in a single vectorized pass:
+    Computes pre-mask logit metrics in a single zero-sync vectorized pass:
     - killed_mass: 1.0 - sum(P_pre[valid])
     - refusal_suppression: sum(P_pre[refusal & ~valid])
     - top1_rank_shift: rank of top valid token in pre-mask distribution (0 if top1 is valid)
-
-    Returns:
-        (killed_mass, refusal_suppression, top1_rank_shift) as 1D tensors of length batch_size.
     """
     if logits.ndim == 1:
         logits = logits.unsqueeze(0)
@@ -103,39 +120,36 @@ def compute_metrics_vectorized(
     elif valid_mask.shape[-1] > vocab_size:
         valid_mask = valid_mask[:, :vocab_size]
 
-    # 1. Softmax over pre-mask logits
-    P_pre = torch.softmax(logits.float(), dim=-1)
+    logits_f = logits if logits.dtype == torch.float32 else logits.float()
+    P_pre = torch.softmax(logits_f, dim=-1)
+    zero_f = _get_zero(logits_f.device, torch.float32)
 
-    # 2. Killed mass: total probability suppressed by the grammar
-    # Zero out disallowed tokens to sum valid mass
-    valid_mass = (P_pre * valid_mask.float()).sum(dim=-1)
+    valid_mass = torch.where(valid_mask, P_pre, zero_f).sum(dim=-1)
     killed_mass = (1.0 - valid_mass).clamp(min=0.0, max=1.0)
 
-    # 3. Refusal suppression: mass allocated to refusal onset tokens that are disallowed
-    if refusal_mask.ndim == 1:
-        refusal_mask = refusal_mask.unsqueeze(0)
-
-    if refusal_mask.shape[-1] < vocab_size:
-        pad = torch.zeros((refusal_mask.shape[0], vocab_size - refusal_mask.shape[-1]), dtype=torch.bool, device=refusal_mask.device)
-        refusal_mask = torch.cat([refusal_mask, pad], dim=-1)
-    elif refusal_mask.shape[-1] > vocab_size:
-        refusal_mask = refusal_mask[:, :vocab_size]
-
-    refusal_suppressed_mask = refusal_mask & (~valid_mask)
-    if refusal_suppressed_mask.any():
-        refusal_suppression = (P_pre * refusal_suppressed_mask.float()).sum(dim=-1)
+    if refusal_indices is not None:
+        if refusal_indices.numel() > 0:
+            disallowed_ref = ~valid_mask[:, refusal_indices]
+            refusal_suppression = (P_pre[:, refusal_indices] * disallowed_ref).sum(dim=-1)
+        else:
+            refusal_suppression = torch.zeros(batch_size, device=logits.device, dtype=torch.float32)
     else:
-        refusal_suppression = torch.zeros(batch_size, device=logits.device, dtype=torch.float32)
+        if refusal_mask.ndim == 1:
+            refusal_mask = refusal_mask.unsqueeze(0)
+        if refusal_mask.shape[-1] < vocab_size:
+            pad = torch.zeros((refusal_mask.shape[0], vocab_size - refusal_mask.shape[-1]), dtype=torch.bool, device=refusal_mask.device)
+            refusal_mask = torch.cat([refusal_mask, pad], dim=-1)
+        elif refusal_mask.shape[-1] > vocab_size:
+            refusal_mask = refusal_mask[:, :vocab_size]
+        refusal_suppressed_mask = refusal_mask & (~valid_mask)
+        refusal_suppression = torch.where(refusal_suppressed_mask, P_pre, zero_f).sum(dim=-1)
 
-    # 4. Top-1 rank shift
-    top1_pre = torch.argmax(logits, dim=-1)  # shape: (batch_size,)
-    top1_is_valid = valid_mask.gather(1, top1_pre.unsqueeze(1)).squeeze(1)  # bool (batch_size,)
+    top1_pre = torch.argmax(logits_f, dim=-1)
+    top1_is_valid = valid_mask.gather(1, top1_pre.unsqueeze(1)).squeeze(1)
 
-    if top1_is_valid.all():
-        top1_rank_shift = torch.zeros(batch_size, dtype=torch.long, device=logits.device)
-    else:
-        top_valid_logits = torch.where(valid_mask, logits, -float("inf")).max(dim=-1, keepdim=True).values
-        rank_shifts = (logits > top_valid_logits).sum(dim=-1)
-        top1_rank_shift = torch.where(top1_is_valid, torch.zeros_like(rank_shifts), rank_shifts)
+    top_valid_logits = logits_f.masked_fill(~valid_mask, -float("inf")).max(dim=-1, keepdim=True).values
+    rank_shifts = (logits_f > top_valid_logits).sum(dim=-1)
+    zero_i = torch.zeros_like(rank_shifts)
+    top1_rank_shift = torch.where(top1_is_valid, zero_i, rank_shifts)
 
     return killed_mass, refusal_suppression, top1_rank_shift
