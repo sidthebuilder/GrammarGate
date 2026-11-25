@@ -142,6 +142,44 @@ def test_vllm_v1_trips_and_safe_escapes():
     assert torch.isneginf(out[0, 190])
 
 
+def test_vllm_v1_token_acceptor_advancement():
+    """Tests vLLM V1 advances token_acceptor via output_token_ids and accept_token."""
+    vocab_size = 200
+    v1_processor = GrammarGateVllmV1Processor(device="cpu")
+    accepted: list[int] = []
+    output_tokens: list[int] = []
+
+    def mask_provider(step, v_size):
+        m = torch.zeros(v_size, dtype=torch.bool)
+        m[10:20] = True
+        return pack_boolean_mask(m)
+
+    req = RequestGrammarState(
+        request_id="seq_adv",
+        bitmask_provider=mask_provider,
+        token_acceptor=lambda tid: accepted.append(tid) or True,
+        output_token_ids=output_tokens,
+    )
+    v1_processor.update_state(BatchUpdate(added={0: req}))
+
+    # Step 0: no generated tokens yet
+    logits0 = torch.zeros((1, vocab_size), dtype=torch.float32)
+    logits0[0, 12] = 5.0
+    v1_processor.apply(logits0)
+    assert accepted == []
+
+    # Step 1: scheduler appends token 12 -> apply() feeds token_acceptor
+    output_tokens.append(12)
+    logits1 = torch.zeros((1, vocab_size), dtype=torch.float32)
+    logits1[0, 14] = 5.0
+    v1_processor.apply(logits1)
+    assert accepted == [12]
+
+    # Direct push via accept_token also advances matcher
+    v1_processor.accept_token(0, 14)
+    assert accepted == [12, 14]
+
+
 # =====================================================================
 # vLLM V0 & SlotManager Tests (Backward Compatibility)
 # =====================================================================

@@ -40,10 +40,15 @@ class RequestGrammarState:
     eos_token_id: int = 0
     refusal_mask: Optional[torch.Tensor] = None
     config: GateConfig = field(default_factory=GateConfig)
+    output_token_ids: Optional[List[int]] = None
+    escalator: Any = None
+    layer1_elevated: bool = False
     step: int = 0
     is_tripped: bool = False
     last_decision: Optional[GateDecision] = None
     trip_history: List[GateDecision] = field(default_factory=list)
+    _last_accepted_token_count: int = 0
+    _gate: Optional[PreMaskLogitGate] = field(default=None, repr=False, compare=False)
 
 
 # Try importing vLLM V1 LogitsProcessor base class if present; otherwise use standalone base
@@ -132,6 +137,9 @@ class GrammarGateVllmV1Processor(_VllmLogitsProcessorBase):
                         eos_token_id=getattr(state_or_params, "eos_token_id", 0),
                         refusal_mask=getattr(state_or_params, "refusal_mask", None),
                         config=getattr(state_or_params, "config", self.default_config),
+                        output_token_ids=getattr(state_or_params, "output_token_ids", None),
+                        escalator=getattr(state_or_params, "escalator", None),
+                        layer1_elevated=getattr(state_or_params, "layer1_elevated", False),
                     )
 
         # 3. Process moves third (supporting UNIDIRECTIONAL moves and SWAP operations)
@@ -145,6 +153,24 @@ class GrammarGateVllmV1Processor(_VllmLogitsProcessorBase):
             for src_idx, dst_idx in batch_update.moved.items():
                 if src_idx in staged:
                     self.slots[dst_idx] = staged[src_idx]
+
+    def _consume_token(self, state: RequestGrammarState, token_id: int) -> None:
+        if state.token_acceptor is not None:
+            state.token_acceptor(token_id)
+        if state.escalator is not None and not state.is_tripped:
+            esc_dec = state.escalator.step(
+                token_id=token_id,
+                layer1_elevated=state.layer1_elevated,
+                layer2_killed_mass=state.last_decision.killed_mass if state.last_decision else 0.0,
+            )
+            if esc_dec.aborted:
+                state.is_tripped = True
+
+    def accept_token(self, slot_idx: int, token_id: int) -> None:
+        """Advances matcher and optional Layer 3 escalator state for a sampled slot token."""
+        state = self.slots.get(slot_idx)
+        if state is not None:
+            self._consume_token(state, token_id)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         """
@@ -163,6 +189,14 @@ class GrammarGateVllmV1Processor(_VllmLogitsProcessorBase):
             if slot_idx >= batch_size:
                 continue
 
+            # Advance matcher/escalator with any new tokens recorded on state.output_token_ids
+            if state.output_token_ids is not None:
+                num_new = len(state.output_token_ids) - state._last_accepted_token_count
+                if num_new > 0:
+                    for tid in state.output_token_ids[-num_new:]:
+                        self._consume_token(state, tid)
+                    state._last_accepted_token_count = len(state.output_token_ids)
+
             slot_logits = logits[slot_idx : slot_idx + 1]
 
             if state.is_tripped:
@@ -174,13 +208,14 @@ class GrammarGateVllmV1Processor(_VllmLogitsProcessorBase):
             # 1. Obtain step bitmask
             bitmask = state.bitmask_provider(state.step, vocab_size)
 
-            # 2. Inspect pre-mask logits with per-slot config and refusal mask
-            gate = PreMaskLogitGate(
-                config=state.config,
-                refusal_mask=state.refusal_mask,
-                vocab_size=vocab_size,
-            )
-            decision = gate.inspect_pre_mask(slot_logits, bitmask)
+            # 2. Reuse cached per-slot gate when vocab size matches
+            if state._gate is None or state._gate.vocab_size != vocab_size:
+                state._gate = PreMaskLogitGate(
+                    config=state.config,
+                    refusal_mask=state.refusal_mask,
+                    vocab_size=vocab_size,
+                )
+            decision = state._gate.inspect_pre_mask(slot_logits, bitmask)
             state.last_decision = decision
 
             # 3. Handle trip

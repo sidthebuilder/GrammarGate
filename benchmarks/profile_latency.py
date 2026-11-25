@@ -142,9 +142,10 @@ def main():
     print(f"  Max Overhead : {l1['max_us']:.2f} microseconds")
 
     l2 = profile_layer2()
+    target_p95_l2 = 2.50 if device.type == "cuda" else 2.00
     print(f"\n[Layer 2: Pre-Mask Logit Gate] (1,000 iterations, Vocab=32,000)")
     print(f"  p50 Overhead : {l2['p50_ms']:.4f} ms")
-    print(f"  p95 Overhead : {l2['p95_ms']:.4f} ms  (Target: < 0.40 ms)")
+    print(f"  p95 Overhead : {l2['p95_ms']:.4f} ms  (Target: < {target_p95_l2:.2f} ms on {device.type})")
     print(f"  Max Overhead : {l2['max_ms']:.4f} ms")
 
     l3 = profile_layer3()
@@ -154,7 +155,6 @@ def main():
     print(f"  Max Overhead : {l3['max_ms']:.5f} ms")
 
     print("\n" + "=" * 60)
-    target_p95_l2 = 2.50 if device.type == "cuda" else 2.00
     assert l1["p95_us"] < 50.0, f"Layer 1 p95 exceeded target: {l1['p95_us']} us"
     assert l2["p95_ms"] < target_p95_l2, f"Layer 2 p95 exceeded target: {l2['p95_ms']} ms (target: {target_p95_l2} ms for {device.type})"
     assert l3["p95_ms"] < 0.05, f"Layer 3 p95 exceeded target: {l3['p95_ms']} ms"

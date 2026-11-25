@@ -60,12 +60,15 @@ def _find_lib() -> ctypes.CDLL:
             Path(__file__).resolve().parent / name,
         ])
 
-    for c in candidates:
-        if c.is_file():
-            try:
-                return ctypes.CDLL(str(c))
-            except Exception:
-                continue
+    existing = [c for c in candidates if c.is_file()]
+    # Prefer the most recently compiled binary so standalone rustc and cargo builds never shadow each other.
+    existing.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    for c in existing:
+        try:
+            return ctypes.CDLL(str(c))
+        except Exception:
+            continue
     raise ImportError(
         f"Could not find or load compiled grammargate_core cdylib. Searched in: {[str(c) for c in candidates]}. "
         f"Run 'cargo build --release --manifest-path grammargate_core/Cargo.toml' first."
