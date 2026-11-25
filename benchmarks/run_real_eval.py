@@ -304,13 +304,12 @@ class UnguardedXGrammarHfProcessor(LogitsProcessor):
 def run_evaluation(require_native_l1: bool = True, require_xgrammar: bool = True):
     if require_native_l1:
         assert_native_l1_ready()
-    if require_xgrammar:
-        assert_xgrammar_ready()
+    xg_ver = assert_xgrammar_ready() if require_xgrammar else "unverified"
 
     import xgrammar as xgr
     from grammargate.analyzer import analyze_schema
 
-    print(f"=== GrammarGate Real GPU Evaluation Runner (xgrammar {xgr.__version__}) ===")
+    print(f"=== GrammarGate Real GPU Evaluation Runner (xgrammar {xg_ver}) ===")
     print(f"Target Model: {MODEL_ID}")
     print(f"Device: {DEVICE}")
     if torch.cuda.is_available():

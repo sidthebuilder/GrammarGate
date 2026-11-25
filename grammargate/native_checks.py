@@ -4,6 +4,7 @@ Prevents silent fallback to pure-Python heuristics or synthetic token masks in e
 """
 
 from __future__ import annotations
+import importlib.metadata
 import re
 
 MIN_XGRAMMAR_VERSION: tuple[int, int, int] = (0, 2, 9)
@@ -42,6 +43,7 @@ def assert_native_l1_ready() -> None:
 def assert_xgrammar_ready(min_version: tuple[int, ...] = MIN_XGRAMMAR_VERSION) -> str:
     """
     Verifies native `xgrammar` is importable and meets `min_version` (default >= 0.2.9 / XGrammar-2).
+    Uses distribution metadata when `xgrammar.__version__` is omitted at runtime.
     Raises RuntimeError on missing library or older version.
     """
     try:
@@ -51,7 +53,15 @@ def assert_xgrammar_ready(min_version: tuple[int, ...] = MIN_XGRAMMAR_VERSION) -
             f"Native xgrammar>={'.'.join(map(str, min_version))} required (--require-xgrammar) but failed to import: {exc}"
         ) from exc
 
-    ver_str = str(getattr(xgr, "__version__", "0.0.0"))
+    ver_attr = getattr(xgr, "__version__", None)
+    if ver_attr:
+        ver_str = str(ver_attr)
+    else:
+        try:
+            ver_str = str(importlib.metadata.version("xgrammar"))
+        except Exception:
+            ver_str = "0.0.0"
+
     parsed = parse_version_tuple(ver_str)
     if parsed < min_version:
         req = ".".join(map(str, min_version))
