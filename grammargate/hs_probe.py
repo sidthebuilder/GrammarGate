@@ -239,6 +239,10 @@ class HiddenStateRefusalProbe:
         self.probe_time_sec: float = 0.0
         self.probe_calls: int = 0
 
+    def reset_metrics(self) -> None:
+        self.probe_time_sec = 0.0
+        self.probe_calls = 0
+
     def score(self, hidden_vec: torch.Tensor | None = None) -> float:
         """
         Computes centered cosine projection in [-1, 1] onto the calibrated refusal direction.
@@ -656,23 +660,26 @@ class LanguageRoutedRefusalProbe:
         finally:
             self._paused = prev
 
-    def score(self, hidden_vec: torch.Tensor | None = None) -> float | None:
+    def score(self, hidden_vec: torch.Tensor | None = None) -> float:
         vec = hidden_vec if hidden_vec is not None else self._last_hidden
         return self.active_probe.score(vec)
 
     def classify_mask_divergence(
         self,
+        hs_score: float,
         killed_mass: float,
-        strict_refusal_mass: float = 0.0,
-        ambiguous_mass: float = 0.0,
-        hidden_vec: torch.Tensor | None = None,
+        strict_refusal_suppression: float,
+        ambiguous_refusal_suppression: float,
+        top1_rank_shift: int,
+        top1_shift_threshold: int = 5,
     ) -> MaskDivergenceDecision:
-        vec = hidden_vec if hidden_vec is not None else self._last_hidden
         return self.active_probe.classify_mask_divergence(
+            hs_score=hs_score,
             killed_mass=killed_mass,
-            strict_refusal_mass=strict_refusal_mass,
-            ambiguous_mass=ambiguous_mass,
-            hidden_vec=vec,
+            strict_refusal_suppression=strict_refusal_suppression,
+            ambiguous_refusal_suppression=ambiguous_refusal_suppression,
+            top1_rank_shift=top1_rank_shift,
+            top1_shift_threshold=top1_shift_threshold,
         )
 
     @classmethod

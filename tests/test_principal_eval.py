@@ -173,6 +173,39 @@ def test_language_routing_and_qwen05b_ab_separation():
     # English probe stays negative/degraded on Hindi JBB coding attack; routed probe flips sharply positive
     hi_attack = JBB_MULTILINGUAL_TRANSLATIONS[15]["hi"]
     assert _score(routed_probe, hi_attack) > _score(en_probe, hi_attack) + 0.25
+    # Verify reset_metrics and full PreMaskLogitGate dispatch compatibility on both probes
+    from grammargate.bitmask_utils import pack_boolean_mask
+    from grammargate.gate import GateConfig, PreMaskLogitGate
+    from grammargate.refusal_tokens import RefusalTokenResolver
+
+    en_probe.reset_metrics()
+    routed_probe.reset_metrics()
+    assert en_probe.probe_calls == 0 and routed_probe.probe_calls == 0
+
+    vocab_size = int(model.get_output_embeddings().weight.shape[0])
+    parts = RefusalTokenResolver(tokenizer=tok).get_partitioned_masks(vocab_size)
+    gate = PreMaskLogitGate(
+        refusal_mask=parts["combined"],
+        strict_refusal_mask=parts["strict"],
+        ambiguous_onset_mask=parts["ambiguous"],
+        benign_transition_mask=parts["benign_transition"],
+        vocab_size=vocab_size,
+        config=GateConfig(use_hs_gate=True, strict_refusal_threshold=0.01, killed_mass_threshold=0.98),
+    )
+    allowed = torch.ones(vocab_size, dtype=torch.bool)
+    bitmask = pack_boolean_mask(allowed)
+    routed_probe.set_prompt(hi_attack)
+    routed_probe.attach(model)
+    try:
+        ids = tok(format_chat_prompt(hi_attack, tok), return_tensors="pt")["input_ids"]
+        with torch.no_grad():
+            logits = model(ids).logits[0, -1, :]
+        dec = gate.inspect_pre_mask(logits, bitmask, hs_probe=routed_probe)
+        assert dec.hs_score is not None and dec.hs_quadrant is not None
+        assert routed_probe.probe_calls >= 1
+    finally:
+        routed_probe.detach()
+
     # English benign prompt retains identical score on routed probe vs English-only probe
     en_benign = "Explain the difference between a SQL INNER JOIN and a LEFT JOIN."
     assert abs(_score(routed_probe, en_benign) - _score(en_probe, en_benign)) < 1e-4
