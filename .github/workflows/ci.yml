@@ -40,7 +40,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install --upgrade pytest "xgrammar>=0.2.9" transformers numpy pydantic jsonschema
+          pip install pytest "xgrammar>=0.2.9" transformers numpy pydantic jsonschema huggingface_hub pyarrow scipy sentence-transformers
 
       - name: Run Rust FFI & Native XGrammar Tests
         env:
@@ -68,11 +68,12 @@ jobs:
                  tests/test_hs_gate.py \
                  -v --tb=short --junitxml=pytest-gates.xml
 
-      - name: Run Ablation & CDA Benchmark Suites
+      - name: Run Ablation, Principal Corpus & CDA Benchmark Suites
         env:
           PYTHONPATH: .
         run: |
           pytest tests/test_ablation_runner.py \
+                 tests/test_principal_eval.py \
                  benchmarks/attacks/ \
                  benchmarks/utility/ \
                  -v --tb=short --junitxml=pytest-bench.xml

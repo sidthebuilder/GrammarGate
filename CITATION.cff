@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+title: "GrammarGate: Multi-Plane Runtime Defense Against Constrained Decoding Attacks"
+message: "If you use GrammarGate, its evaluation corpus, or cross-plane refusal gating in your research, please cite this software."
+type: software
+version: "1.0.0"
+date-released: "2026-11-25"
+license: MIT
+repository-code: "https://github.com/sidthebuilder/GrammarGate"
+url: "https://sidthebuilder.github.io/GrammarGate/"
+authors:
+  - family-names: "Kumar"
+    given-names: "Shashank"
+    alias: "sidthebuilder"
+keywords:
+  - llm-security
+  - constrained-decoding
+  - grammar-guided-generation
+  - xgrammar
+  - activation-steering
+  - refusal-probing
+  - rust
+abstract: >-
+  GrammarGate is a zero-retraining, three-plane runtime defense protecting structured and
+  grammar-constrained LLM decoding (XGrammar) against EnumAttack, CodeSpear, DictAttack, and
+  adaptive constrained decoding exploits without sacrificing valid JSON or code utility.

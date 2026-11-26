@@ -12,7 +12,8 @@ and couples it with XGrammar bitmask clipping metrics in a 2x2 Mask-Divergence m
 from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Dict, Iterable, Iterator, List, Sequence
+import re
 import time
 import torch
 
@@ -131,10 +132,16 @@ DEFAULT_MULTILINGUAL_CALIBRATION_BENIGN = [
 ]
 
 
-def format_chat_prompt(user_text: str, tokenizer: Any = None, wrap: bool = True) -> str:
+def format_chat_prompt(
+    user_text: str,
+    tokenizer: Any = None,
+    wrap: bool = True,
+    enable_thinking: bool = False,
+) -> str:
     """
     Formats a user instruction using tokenizer chat templates for non-ChatML models
-    (Llama-3.1, Gemma-2, Mistral), while keeping exact ChatML formatting on Qwen-style models.
+    (Llama-3.1, Gemma-2, Mistral) and Qwen3 thinking-enabled templates (forcing
+    enable_thinking=False when supported), while preserving fast ChatML defaults on Qwen2.5.
     """
     if (
         not wrap
@@ -145,15 +152,33 @@ def format_chat_prompt(user_text: str, tokenizer: Any = None, wrap: bool = True)
         return user_text
     if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
         tmpl = str(getattr(tokenizer, "chat_template", "") or "")
-        if tmpl and "<|im_start|>" not in tmpl:
+        needs_template = bool(tmpl) and (
+            "<|im_start|>" not in tmpl
+            or "enable_thinking" in tmpl
+            or "<think>" in tmpl
+        )
+        if needs_template:
+            msgs = [{"role": "user", "content": user_text}]
             try:
                 return str(
                     tokenizer.apply_chat_template(
-                        [{"role": "user", "content": user_text}],
+                        msgs,
                         tokenize=False,
                         add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
                     )
                 )
+            except TypeError:
+                try:
+                    return str(
+                        tokenizer.apply_chat_template(
+                            msgs,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                        )
+                    )
+                except Exception:
+                    pass
             except Exception:
                 pass
     return f"<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n"
@@ -477,3 +502,248 @@ class HiddenStateRefusalProbe:
             layer_idx=best_layer,
             config=final_cfg,
         )
+
+
+_ES_HINTS = {
+    "escribe", "desarrolla", "crea", "genera", "implementa", "responde", "solo", "codigo",
+    "contrasenas", "para", "con", "que", "del", "archivo", "archivos", "computadora",
+    "cifrar", "omitir", "verificacion", "descifrar", "datos", "script", "ataque", "clave",
+    "un", "una", "los", "las", "usuario", "criptomonedas",
+}
+_FR_HINTS = {
+    "ecris", "fournis", "uniquement", "developpe", "cree", "genere", "implemente", "avec",
+    "pour", "dans", "des", "les", "une", "chiffre", "chiffrer", "rancon", "rancongiciel",
+    "logiciel", "malveillant", "ordinateur", "fichiers", "donnees", "serveur", "formulaire",
+    "contourner", "mots", "passe", "reseau", "attaque", "script", "automatise", "ouvrant",
+    "ouvrir", "voler",
+}
+
+
+def detect_prompt_language(text: str) -> str:
+    """
+    Lightweight deterministic language router across supported calibration languages
+    ('en', 'es', 'fr', 'hi', 'zh') supporting both diacritic and ASCII forms.
+    """
+    clean = text
+    for tag in ("<|im_start|>user\n", "<|im_start|>assistant\n", "<|im_end|>", "<bos>", "<start_of_turn>user\n", "<end_of_turn>"):
+        clean = clean.replace(tag, " ")
+    if re.search(r"[\u0900-\u097f]", clean):
+        return "hi"
+    if re.search(r"[\u4e00-\u9fff]", clean):
+        return "zh"
+
+    lower = clean.lower()
+    es_score = 0
+    fr_score = 0
+    if any(ch in lower for ch in ("ñ", "¿", "¡", "á", "í", "ó", "ú")):
+        es_score += 2
+    if any(ch in lower for ch in ("ç", "é", "è", "ê", "à", "ù", "î", "ï", "ô", "œ")):
+        fr_score += 2
+
+    words = re.findall(r"[a-z]+", lower)
+    # Remove accents for ASCII stopword lookup
+    norm_ascii = (
+        lower.replace("é", "e").replace("è", "e").replace("ê", "e").replace("à", "a")
+        .replace("ç", "c").replace("í", "i").replace("ó", "o").replace("ú", "u")
+        .replace("á", "a").replace("ñ", "n")
+    )
+    norm_words = re.findall(r"[a-z]+", norm_ascii)
+    # Count unambiguous cues (note "script" appears in ES/FR/EN, so exclude ambiguous English cognates)
+    es_hits = sum(1 for w in norm_words if w in _ES_HINTS and w != "script")
+    fr_hits = sum(1 for w in norm_words if w in _FR_HINTS and w != "script")
+    es_score += es_hits
+    fr_score += fr_hits
+
+    if es_score >= 2 and es_score > fr_score:
+        return "es"
+    if fr_score >= 2 and fr_score > es_score:
+        return "fr"
+    # Handle strong single-marker Spanish/French cues when diacritic matched
+    if es_score >= 2 and fr_score == es_score and any(ch in lower for ch in ("ñ", "¿", "¡")):
+        return "es"
+    if fr_score >= 2 and fr_score >= es_score:
+        return "fr"
+    return "en"
+
+
+class LanguageRoutedRefusalProbe:
+    """
+    Lightweight language-routed hidden-state refusal probe.
+
+    Maintains isolated per-language normalized refusal directions (EN/ES/FR/HI/ZH)
+    at a single shared transformer decoder layer. Routing happens once per prompt via
+    `set_prompt(prompt_text)` or `set_active_language(lang)` with zero cross-lingual
+    vector dilution and zero extra forward passes.
+    """
+
+    def __init__(
+        self,
+        probes: Dict[str, HiddenStateRefusalProbe],
+        layer_idx: int,
+        default_lang: str = "en",
+    ):
+        if default_lang not in probes:
+            default_lang = next(iter(probes))
+        self.probes = probes
+        self.layer_idx = layer_idx
+        self.default_lang = default_lang
+        self.active_lang = default_lang
+        self._paused = False
+        self._last_hidden: torch.Tensor | None = None
+        self._hook_handle = None
+
+    @property
+    def active_probe(self) -> HiddenStateRefusalProbe:
+        return self.probes.get(self.active_lang, self.probes[self.default_lang])
+
+    @property
+    def config(self) -> ProbeConfig:
+        return self.active_probe.config
+
+    @property
+    def languages(self) -> List[str]:
+        return sorted(self.probes.keys())
+
+    @property
+    def probe_time_sec(self) -> float:
+        return sum(p.probe_time_sec for p in self.probes.values())
+
+    @property
+    def probe_calls(self) -> int:
+        return sum(p.probe_calls for p in self.probes.values())
+
+    def reset_metrics(self) -> None:
+        for p in self.probes.values():
+            p.reset_metrics()
+
+    def set_active_language(self, lang: str) -> str:
+        resolved = lang if lang in self.probes else self.default_lang
+        self.active_lang = resolved
+        return resolved
+
+    def set_prompt(self, text: str) -> str:
+        detected = detect_prompt_language(text)
+        return self.set_active_language(detected)
+
+    def attach(self, model: Any):
+        self.detach()
+        layers = get_transformer_layers(model)
+        target_layer = layers[self.layer_idx]
+
+        def _hook(_module, _inputs, output):
+            if self._paused:
+                return
+            hidden = output[0] if isinstance(output, tuple) else output
+            if hidden.dim() == 3:
+                self._last_hidden = hidden[0, -1, :].detach()
+            elif hidden.dim() == 2:
+                self._last_hidden = hidden[-1, :].detach()
+
+        self._hook_handle = target_layer.register_forward_hook(_hook)
+        return self._hook_handle
+
+    def detach(self) -> None:
+        if self._hook_handle is not None:
+            self._hook_handle.remove()
+            self._hook_handle = None
+
+    @contextmanager
+    def pause(self) -> Iterator[None]:
+        prev = self._paused
+        self._paused = True
+        try:
+            yield
+        finally:
+            self._paused = prev
+
+    def score(self, hidden_vec: torch.Tensor | None = None) -> float | None:
+        vec = hidden_vec if hidden_vec is not None else self._last_hidden
+        return self.active_probe.score(vec)
+
+    def classify_mask_divergence(
+        self,
+        killed_mass: float,
+        strict_refusal_mass: float = 0.0,
+        ambiguous_mass: float = 0.0,
+        hidden_vec: torch.Tensor | None = None,
+    ) -> MaskDivergenceDecision:
+        vec = hidden_vec if hidden_vec is not None else self._last_hidden
+        return self.active_probe.classify_mask_divergence(
+            killed_mass=killed_mass,
+            strict_refusal_mass=strict_refusal_mass,
+            ambiguous_mass=ambiguous_mass,
+            hidden_vec=vec,
+        )
+
+    @classmethod
+    def from_model_calibration(
+        cls,
+        model: Any,
+        tokenizer: Any,
+        harmful_prompts: Sequence[str] | None = None,
+        benign_prompts: Sequence[str] | None = None,
+        layer_idx: int = -1,
+        sweep_layers: bool = True,
+        config: ProbeConfig | None = None,
+        chat_wrap: bool = True,
+    ) -> "LanguageRoutedRefusalProbe":
+        if harmful_prompts is None or benign_prompts is None:
+            # Keep the English direction identical to English-only calibration to prevent
+            # domain drift on English benign tasks, while extracting dedicated non-English
+            # directions per language from the multilingual parallel split.
+            en_h = list(DEFAULT_CALIBRATION_HARMFUL)
+            en_b = list(DEFAULT_CALIBRATION_BENIGN)
+            h_ml = list(DEFAULT_MULTILINGUAL_CALIBRATION_HARMFUL)
+            b_ml = list(DEFAULT_MULTILINGUAL_CALIBRATION_BENIGN)
+        else:
+            all_h = list(harmful_prompts)
+            all_b = list(benign_prompts)
+            en_h = [p for p in all_h if detect_prompt_language(p) == "en"]
+            en_b = [p for p in all_b if detect_prompt_language(p) == "en"]
+            h_ml = [p for p in all_h if detect_prompt_language(p) != "en"]
+            b_ml = [p for p in all_b if detect_prompt_language(p) != "en"]
+
+        by_lang_h: Dict[str, List[str]] = {}
+        by_lang_b: Dict[str, List[str]] = {}
+        for hp in h_ml:
+            lang = detect_prompt_language(hp)
+            if lang != "en":
+                by_lang_h.setdefault(lang, []).append(hp)
+        for bp in b_ml:
+            lang = detect_prompt_language(bp)
+            if lang != "en":
+                by_lang_b.setdefault(lang, []).append(bp)
+
+        if not en_h or not en_b:
+            en_h = list(DEFAULT_CALIBRATION_HARMFUL)
+            en_b = list(DEFAULT_CALIBRATION_BENIGN)
+        en_probe = HiddenStateRefusalProbe.from_model_calibration(
+            model=model,
+            tokenizer=tokenizer,
+            harmful_prompts=en_h,
+            benign_prompts=en_b,
+            layer_idx=layer_idx,
+            sweep_layers=sweep_layers if layer_idx < 0 else False,
+            config=config,
+            chat_wrap=chat_wrap,
+        )
+        shared_layer = en_probe.layer_idx
+        probes: Dict[str, HiddenStateRefusalProbe] = {"en": en_probe}
+
+        for lang in sorted(set(by_lang_h.keys()) & set(by_lang_b.keys())):
+            lh = by_lang_h[lang]
+            lb = by_lang_b[lang]
+            if not lh or not lb:
+                continue
+            probes[lang] = HiddenStateRefusalProbe.from_model_calibration(
+                model=model,
+                tokenizer=tokenizer,
+                harmful_prompts=lh,
+                benign_prompts=lb,
+                layer_idx=shared_layer,
+                sweep_layers=False,
+                config=config,
+                chat_wrap=chat_wrap,
+            )
+
+        return cls(probes=probes, layer_idx=shared_layer, default_lang="en")

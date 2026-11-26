@@ -107,6 +107,8 @@ class GrammarGateHfProcessor(LogitsProcessor):
         self.hs_probe = hs_probe
         self.hs_scores: list[float] = []
         self.pure_gate_time_sec: float = 0.0
+        self.l2_gate_time_sec: float = 0.0
+        self.l3_escalator_time_sec: float = 0.0
         self.total_gate_time_sec: float = 0.0
         self.speculative_time_sec: float = 0.0
         self.speculative_checks: int = 0
@@ -183,7 +185,9 @@ class GrammarGateHfProcessor(LogitsProcessor):
                     layer2_killed_mass=self.last_decision.killed_mass if self.last_decision else 0.0,
                     is_final=(last_token == self.eos_token_id),
                 )
-                self.pure_gate_time_sec += (time.perf_counter() - t_l3_0)
+                l3_dt = time.perf_counter() - t_l3_0
+                self.l3_escalator_time_sec += l3_dt
+                self.pure_gate_time_sec += l3_dt
                 if esc_dec.aborted:
                     self.is_tripped = True
                     self.trip_source = "L3"
@@ -217,7 +221,9 @@ class GrammarGateHfProcessor(LogitsProcessor):
             lookahead_logits_fn=step_lookahead,
             hs_probe=self.hs_probe,
         )
-        self.pure_gate_time_sec += (time.perf_counter() - t_pure_0)
+        l2_dt = time.perf_counter() - t_pure_0
+        self.l2_gate_time_sec += l2_dt
+        self.pure_gate_time_sec += l2_dt
         if decision.hs_score is not None:
             self.hs_scores.append(decision.hs_score)
             if self.max_hs_score is None or decision.hs_score > self.max_hs_score:

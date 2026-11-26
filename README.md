@@ -62,7 +62,8 @@ User Prompt + Schema/CFG
   - Partitions refusal tokens into unambiguous `strict_refusal_ids` (`"sorry"`, `"cannot"`, `"unable"`), overloaded unigram `ambiguous_onset_ids` (`"I"`, `"It"`, `"As"`), and `benign_transition_ids` (`"Sure"`, `"Here"`, `"#"`, `"```"`).
   - When `ambiguous_onset_ids` mass crosses threshold and exceeds suppressed benign transitions, `CachedPrefixLookahead` runs a read-only 1-token forward pass over a private KV cache and rolls back cleanly (`DynamicCache.crop(-1)`), checking conditional and joint continuation probabilities before tripping.
 - **Mechanism 2 — `HS-Gate` ([hs_probe.py](grammargate/hs_probe.py)):**
-  - Training-free frozen difference-in-means residual-stream probe calibrated on held-out harmful vs. benign prompts (`DEFAULT_CALIBRATION_HARMFUL` / `DEFAULT_CALIBRATION_BENIGN`, automatic Fisher $d$-prime layer selection, plus `format_chat_prompt` supporting ChatML/Qwen and native `apply_chat_template` models such as Llama-3.1 and Gemma-2).
+  - Training-free frozen difference-in-means residual-stream probe calibrated on held-out harmful vs. benign prompts (`DEFAULT_CALIBRATION_HARMFUL` / `DEFAULT_CALIBRATION_BENIGN`, automatic Fisher $d$-prime layer selection, plus `format_chat_prompt` supporting ChatML/Qwen, `Qwen3` `enable_thinking=False`, and native `apply_chat_template` models such as Phi-4 and Mistral).
+  - Includes `LanguageRoutedRefusalProbe` and `detect_prompt_language` (`en`, `es`, `fr`, `hi`, `zh`) isolating per-language normalized directions at a single shared layer so non-English separation strengthens without cross-lingual vector dilution on English benign tasks.
   - Evaluates centered cosine projection `hs_score` in $O(d_{\text{model}})$ and combines it with XGrammar mask clipping in a 2×2 Mask-Divergence Matrix:
     - **High Clipping + Strict Refusal ($\ge 0.25$):** Block (`HIGH_CLIP_STRICT_REFUSAL` safety floor).
     - **High Clipping + High `hs_score` ($\ge 0.05$):** Block (`HIGH_CLIP_HIGH_HS`, catches CodeSpear).
@@ -176,9 +177,9 @@ Latest verified CPU timings after the single-sync sparse `ref_indices` optimizat
 | **Layer 1 Static Analyzer** | `$ref`/`$defs`, `\uXXXX` + surrogates, rigid `pattern`, EBNF `#`/`//` comments, and benign multi-option API `enum` separation implemented in Rust (`grammargate_core/src/`) | Latest Rust unit & FFI tests unverified on Windows host (blocked by Application Control); executed on Ubuntu CI & Modal (`--require-native-l1`) |
 | **Layer 2 Pre-Mask Gate** | Single-`softmax`, sparse `ref_indices`, 1-sync optimization verified (`p95 = 1.61 ms` CPU @ `32k`, `2.66 ms` @ `151.9k`) | Post-optimization CUDA latency (`< 2.50 ms` target @ `151.9k`) unverified locally (`CUDA: False`) |
 | **Mechanism 1 (`SpecLook`)** | Strict/ambiguous partition + private KV-cache `crop(-1)` rollback verified on `Qwen2.5-0.5B` (`0.0%` Benign FPR, `4.7%` spec rate) | Alone allows `80.0%` CodeSpear ASR and `100.0%` Enum/Dict ASR |
-| **Mechanism 2 (`HS-Gate`)** | Cuts CodeSpear ASR & Benign FPR to `0.0%` on `Qwen2.5-0.5B` (`N=5/cat`); A/B test confirms EN calibration > pooled multilingual linear vector | Single linear EN direction misses non-English `adaptive_multilingual_2` / Hindi; single pooled multilingual direction hurts EN CodeSpear (`0.0% -> 40.0%` ASR); misses Enum/Dict without L1/L3 |
+| **Mechanism 2 (`HS-Gate`)** | Cuts CodeSpear ASR & Benign FPR to `0.0%` on `Qwen2.5-0.5B` (`N=5/cat`); `LanguageRoutedRefusalProbe` preserves exact English benign separation (`< 1e-4` delta) while boosting non-English CodeSpear refusal scores (e.g., `+0.25+` on Hindi `JBB_15` on `Qwen2.5-0.5B`) | Single linear EN direction misses non-English `adaptive_multilingual_2` / Hindi; single pooled multilingual direction hurts EN CodeSpear (`0.0% -> 40.0%` ASR); `N >= 100` multi-model GPU sweeps with `LanguageRoutedRefusalProbe` await Modal GPU execution |
 | **Mechanism 3 (`Plane-Sync`)** | Catches fragmented `dict_frag_1..5` (`trip_source: "L3"`) + `finalize()` trailing-buffer flush verified | Semantic judge relies on lightweight cluster rules + optional MiniLM embeddings |
-| **Scale & Model Coverage** | `Qwen2.5-0.5B` CPU ablation (`N=5/cat`), `Qwen2.5-3B` baseline GPU smoke (`N=10/cat`), vLLM V1 slot lifecycle unit tests | Large-`N` (`>= 50`) real `XGrammar` GPU sweeps via [modal_vllm_eval.py](benchmarks/modal_vllm_eval.py) across multiple model families (`Qwen2.5-3B`, `Llama-3.1-8B` / `Gemma-2-2B`) ready to launch, not yet executed |
+| **Scale & Model Coverage** | `Qwen2.5-0.5B` CPU ablation (`N=5/cat`), `Qwen2.5-3B` baseline GPU smoke (`N=10/cat`), vLLM V1 slot lifecycle unit tests; zero-synthetic v1.0 HF corpus ([corpus_v1.py](benchmarks/corpus_v1.py), 650 items, SHA-256 [`dataset_manifest.json`](benchmarks/results_v1/dataset_manifest.json)) with 0 5-gram calibration overlap verified | Full multi-model GPU sweeps across `Qwen/Qwen3-4B-Instruct-2507`, `microsoft/Phi-4-mini-instruct`, and `mistralai/Mistral-7B-Instruct-v0.3` ([run_principal_eval.py](benchmarks/run_principal_eval.py) / [modal_vllm_eval.py](benchmarks/modal_vllm_eval.py)) are ready to run but have not yet been executed on CUDA/Modal |
 
 ---
 
@@ -206,14 +207,15 @@ pytest tests/test_logit_gate.py \
        tests/test_vllm_adapter.py \
        tests/test_speclook_gate.py \
        tests/test_hs_gate.py \
-       tests/test_ablation_runner.py -v
+       tests/test_ablation_runner.py \
+       tests/test_principal_eval.py -v
 ```
-Full Ubuntu CI suite (Rust tests + native `cdylib` FFI + all attack/utility/ablation suites; configured in [.github/workflows/ci.yml](.github/workflows/ci.yml)):
+Full Ubuntu CI suite (Rust tests + native `cdylib` FFI + all attack/utility/ablation/principal v1.0 suites; configured in [.github/workflows/ci.yml](.github/workflows/ci.yml)):
 ```bash
-PYTHONPATH=. pytest tests/test_rust_core.py tests/test_rust_analyzer.py tests/test_logit_gate.py tests/test_escalator.py tests/test_vllm_adapter.py tests/test_speclook_gate.py tests/test_hs_gate.py tests/test_ablation_runner.py benchmarks/attacks/ benchmarks/utility/ -v
+PYTHONPATH=. pytest tests/test_rust_core.py tests/test_rust_analyzer.py tests/test_native_xgrammar_ci.py tests/test_logit_gate.py tests/test_escalator.py tests/test_vllm_adapter.py tests/test_speclook_gate.py tests/test_hs_gate.py tests/test_ablation_runner.py tests/test_principal_eval.py benchmarks/attacks/ benchmarks/utility/ -v
 ```
 
-### 4. Run Ablation, Multilingual A/B, Profiler & GPU / Modal Evaluations
+### 4. Run Ablation, Principal v1.0 Corpus, Profiler & GPU / Modal Evaluations
 ```bash
 # Latency microbenchmarks (CPU or CUDA):
 python benchmarks/profile_latency.py
@@ -230,11 +232,13 @@ python benchmarks/run_ablation_and_adaptive.py \
     --require-xgrammar \
     --output benchmarks/results_ablation_05b.jsonl
 
-# Real CUDA + XGrammar evaluation (50-task suite):
-python benchmarks/run_real_eval.py
+# Principal v1.0 zero-synthetic multi-model CUDA + XGrammar evaluation (greedy + stochastic 3-seed sweep):
+python benchmarks/run_principal_eval.py \
+    --models Qwen/Qwen3-4B-Instruct-2507,microsoft/Phi-4-mini-instruct,mistralai/Mistral-7B-Instruct-v0.3 \
+    --n-jsb 100 --n-humaneval 100 --n-jbb 100 --decode-regimes all
 
-# Cloud A10G XGrammar ablation sweep across multiple model families (`N >= 50`):
-modal run benchmarks/modal_vllm_eval.py --models Qwen/Qwen2.5-3B-Instruct,google/gemma-2-2b-it --n-per-category 50
+# Cloud A10G / H100 XGrammar v1.0 sweep across ungated model families via Modal:
+modal run benchmarks/modal_vllm_eval.py --gpu A10G
 ```
 
 ---
@@ -324,7 +328,8 @@ masked_logits = processor.apply(batch_logits)
 ## Repository Structure
 
 ```text
-├── .github/workflows/ci.yml              # Ubuntu CI workflow (cargo test/build + full CPU test suite)
+├── .github/workflows/ci.yml              # Ubuntu CI workflow (cargo test/build + native XGrammar & principal tests)
+├── CITATION.cff                          # Zenodo / academic software citation metadata (v1.0.0)
 ├── Cargo.toml                            # Cargo workspace definition
 ├── grammargate_core/                     # Native Rust Layer 1 Static Analyzer
 │   ├── Cargo.toml                        # Zero-dependency Rust manifest
@@ -336,8 +341,9 @@ masked_logits = processor.apply(batch_logits)
 │   ├── bitmask_utils.py                  # Vectorized bitmask unpacking & single-pass metric reductions
 │   ├── escalator.py                      # Layer 3 Plane-Sync escalator, leaf normalizer, finalize(), SemanticSafetyJudge
 │   ├── gate.py                           # Layer 2 single-sync PreMaskLogitGate, SpecLook & HS-Gate dispatch, Safe-Escape
-│   ├── hs_probe.py                       # Mechanism 2 frozen residual-stream probe (EN & multilingual), format_chat_prompt
+│   ├── hs_probe.py                       # Mechanism 2 frozen residual probe (EN, pooled & language-routed), format_chat_prompt
 │   ├── model_utils.py                    # Local snapshot / HF Hub model resolver
+│   ├── native_checks.py                  # Strict fail-loud guards for native Rust L1 & XGrammar >= 0.2.9
 │   ├── preamble_utils.py                 # Optional EBNF prose/code-fence envelope wrapper
 │   ├── refusal_tokens.py                 # Partitioned refusal onset/strict/ambiguous/continuation resolver
 │   └── telemetry.py                      # Structured audit record dataclasses
@@ -347,6 +353,8 @@ masked_logits = processor.apply(batch_logits)
 │   ├── test_hf_adapter.py                # XGrammar + CUDA HF integration tests
 │   ├── test_hs_gate.py                   # 2x2 Mask-Divergence, Qwen sensitivity & multilingual calibration tests
 │   ├── test_logit_gate.py                # Pre-mask invariant, sparse parity & safe-escape tests
+│   ├── test_native_xgrammar_ci.py        # Ubuntu CI zero-fallback Rust + XGrammar >= 0.2.9 bitmask tests
+│   ├── test_principal_eval.py            # Public v1.0 corpus, judge, Wilson/bootstrap CIs & language routing tests
 │   ├── test_rust_analyzer.py             # Python-to-Rust AST schema/grammar & benign API enum tests
 │   ├── test_rust_core.py                 # Native FFI & memory-safety checks
 │   ├── test_speclook_gate.py             # Ambiguous vs. strict partition & KV rollback tests
@@ -357,11 +365,15 @@ masked_logits = processor.apply(batch_logits)
 │   ├── generators/                       # Large-scale deterministic dataset generator
 │   ├── ablation/                         # Synthetic three-plane factorial ablation runner
 │   ├── baselines/                        # Baseline comparison helper script
-│   ├── modal_vllm_eval.py                # Modal A10G XGrammar multi-model ablation runner (--require-native-l1/--require-xgrammar)
+│   ├── corpus_v1.py                      # Zero-synthetic v1.0 HF corpus loader (JBB, JSONSchemaBench, HumanEval)
+│   ├── metrics_v1.py                     # Wilson CIs, 1,000-resample bootstrap AUROC/TPR@1%, OutputComplianceJudge
+│   ├── modal_vllm_eval.py                # Modal A10G/H100 v1.0 multi-model evaluation wrapper
 │   ├── profile_latency.py                # Layer 1 / 2 / 3 microbenchmark profiler
 │   ├── run_ablation_and_adaptive.py      # Disjoint ablation, multilingual A/B & adaptive evaluator
 │   ├── run_large_scale_eval.py           # Large-scale Wilson-CI runner (N >= 1,000)
+│   ├── run_principal_eval.py             # Zero-fallback v1.0 multi-model evaluator (greedy + multi-seed stochastic)
 │   ├── run_real_eval.py                  # Qwen2.5-3B CUDA evaluation (updated with Stealth Dict + AUROC)
+│   ├── results_v1/dataset_manifest.json  # Pinned HF commit SHAs, item SHA-256s & 0-overlap audit manifest
 │   ├── results_ablation_05b.jsonl        # Recorded Qwen2.5-0.5B CPU ablation telemetry (150 rows)
 │   └── results_real_3b.jsonl             # Pre-upgrade Qwen2.5-3B RTX 5050 40-task telemetry
 ├── assets/hero-taj.jpg                   # Landing page hero illustration
