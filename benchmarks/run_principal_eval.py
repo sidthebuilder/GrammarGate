@@ -7,11 +7,13 @@ Strictly zero fallbacks and zero synthetic headline data:
       * JailbreakBench/JBB-Behaviors (harmful + matched benign)
       * epfl-dlab/JSONSchemaBench (Glaiveai2K, Kubernetes, JsonSchemaStore, Github_medium, Github_easy)
       * openai/openai_humaneval (Python tasks under shared PYTHON_CODE_EBNF)
-  - Evaluates 7 regimes: Unguarded, Static-L1-Only, Lexical-L2, SpecLook-Gate, HS-Gate (EN),
-    HS-Gate-Routed (EN/ES/FR/HI/ZH), and Combined (full 3-plane GrammarGate + Plane-Sync L3).
-  - Supports greedy (temp=0.0) and stochastic multi-seed (temp=0.6, top_p=0.9) sweeps,
-    independent OutputComplianceJudge verification, 95% Wilson CIs, 1,000-resample bootstrap
-    AUROC / TPR@1%FPR CIs, and component-wise per-token latency breakdowns.
+  - Evaluates 8 regimes including full Multilingual A/B:
+      Unguarded, Static-L1-Only, Lexical-L2, SpecLook-Gate, HS-Gate (english_only),
+      HS-Gate-Pooled (pooled_multilingual), HS-Gate-Routed (language_routed), and Combined.
+  - Supports full greedy (`temp=0.0`) evaluation + capped stratified stochastic invariance
+    (`temp=0.6, top_p=0.9`, seeds `[101, 202, 303]`, default N=25/cat), independent
+    `OutputComplianceJudge`, 95% Wilson CIs, 1,000-resample bootstrap AUROC/TPR@1%FPR CIs,
+    and per-component CUDA latency breakdowns.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import gc
+import importlib.metadata
 import json
 import os
 from pathlib import Path
@@ -28,7 +31,7 @@ import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessorList
+from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -43,7 +46,11 @@ from grammargate.hs_probe import (
     LanguageRoutedRefusalProbe,
 )
 from grammargate.model_utils import resolve_model_path
-from grammargate.native_checks import assert_native_l1_ready, assert_xgrammar_ready
+from grammargate.native_checks import (
+    assert_native_l1_ready,
+    assert_xgrammar_ready,
+    get_native_l1_info,
+)
 
 from benchmarks.corpus_v1 import PYTHON_CODE_EBNF, build_principal_corpus
 from benchmarks.metrics_v1 import (
@@ -56,9 +63,10 @@ from benchmarks.metrics_v1 import (
 DEFAULT_MODELS: Tuple[str, ...] = (
     "Qwen/Qwen3-4B-Instruct-2507",
     "microsoft/Phi-4-mini-instruct",
-    "mistralai/Mistral-7B-Instruct-v0.3",
+    "allenai/OLMo-2-1124-7B-Instruct",
 )
 DEFAULT_RESULTS_DIR = REPO_ROOT / "benchmarks" / "results_v1"
+STOCHASTIC_SEEDS: Tuple[int, ...] = (101, 202, 303)
 
 
 @dataclass
@@ -68,7 +76,7 @@ class EvalModeConfig:
     l1_only: bool = False
     gate_config: Optional[GateConfig] = None
     use_plane_sync_l3: bool = False
-    hs_mode: str = "none"  # "none", "english", "routed"
+    hs_mode: str = "none"  # "none", "english", "pooled", "routed"
     block_on_forced_l1_json: bool = False
 
 
@@ -86,6 +94,73 @@ def _set_seed(seed: int) -> None:
 def _sync_cuda(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+
+def _pkg_version(dist_name: str) -> str:
+    try:
+        return str(importlib.metadata.version(dist_name))
+    except Exception:
+        return "not-installed"
+
+
+def get_runtime_provenance() -> Dict[str, Any]:
+    """Collects verified runtime dependency versions, GPU device info, and native Rust SHA-256."""
+    assert_native_l1_ready()
+    xgr_ver = assert_xgrammar_ready()
+    rust_info = get_native_l1_info()
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+    vram_gb = (
+        round(torch.cuda.get_device_properties(0).total_memory / (1024**3), 2)
+        if torch.cuda.is_available()
+        else 0.0
+    )
+    return {
+        "torch": str(torch.__version__),
+        "transformers": _pkg_version("transformers"),
+        "xgrammar": xgr_ver,
+        "sentence_transformers": _pkg_version("sentence-transformers"),
+        "cuda_available": bool(torch.cuda.is_available()),
+        "device_name": gpu_name,
+        "vram_gb": vram_gb,
+        "grammargate_core_path": rust_info["path"],
+        "grammargate_core_sha256": rust_info["sha256"],
+    }
+
+
+def _select_stochastic_items(
+    suites: Dict[str, List[Dict[str, Any]]],
+    stochastic_n: int,
+) -> List[Dict[str, Any]]:
+    """
+    Deterministically samples a stratified subset (up to `stochastic_n` per category)
+    preserving strategy/subset/language diversity for multi-seed stochastic invariance sweeps.
+    """
+    selected: List[Dict[str, Any]] = []
+    for _cat, cat_items in suites.items():
+        if stochastic_n <= 0 or len(cat_items) <= stochastic_n:
+            selected.extend(cat_items)
+            continue
+        # Group by strategy/subset/lang so all sub-strata remain proportionally represented
+        buckets: Dict[str, List[Dict[str, Any]]] = {}
+        for item in cat_items:
+            key = str(item.get("strategy") or item.get("subset") or item.get("lang") or "all")
+            buckets.setdefault(key, []).append(item)
+        ordered_keys = sorted(buckets.keys())
+        taken: List[Dict[str, Any]] = []
+        idx = 0
+        while len(taken) < stochastic_n:
+            progressed = False
+            for k in ordered_keys:
+                if idx < len(buckets[k]):
+                    taken.append(buckets[k][idx])
+                    progressed = True
+                    if len(taken) >= stochastic_n:
+                        break
+            if not progressed:
+                break
+            idx += 1
+        selected.extend(taken)
+    return selected
 
 
 def _extract_forced_json_literals(schema_str: str) -> List[str]:
@@ -199,6 +274,16 @@ def _build_mode_configs() -> List[EvalModeConfig]:
             hs_mode="english",
         ),
         EvalModeConfig(
+            name="HS-Gate-Pooled",
+            gate_config=GateConfig(
+                use_speclook=False,
+                use_hs_gate=True,
+                strict_refusal_threshold=0.01,
+                killed_mass_threshold=0.98,
+            ),
+            hs_mode="pooled",
+        ),
+        EvalModeConfig(
             name="HS-Gate-Routed",
             gate_config=GateConfig(
                 use_speclook=False,
@@ -270,6 +355,105 @@ class TimedGrammarMatcher:
         return bool(self._matcher.is_terminated())
 
 
+def _measure_rust_l1_micros(sample_schemas: Sequence[str], iterations: int = 300) -> Dict[str, float]:
+    """Microbenchmarks verified native Rust L1 latency in microseconds over real schemas."""
+    if not sample_schemas:
+        return {"p50_us": 0.0, "p95_us": 0.0, "mean_us": 0.0}
+    for s in sample_schemas[:10]:
+        analyze_schema(s)
+    timings_us: List[float] = []
+    for i in range(iterations):
+        s = sample_schemas[i % len(sample_schemas)]
+        t0 = time.perf_counter()
+        analyze_schema(s)
+        timings_us.append((time.perf_counter() - t0) * 1_000_000.0)
+    timings_us.sort()
+    p50 = timings_us[len(timings_us) // 2]
+    p95 = timings_us[min(len(timings_us) - 1, int(0.95 * len(timings_us)))]
+    return {
+        "p50_us": round(p50, 2),
+        "p95_us": round(p95, 2),
+        "mean_us": round(sum(timings_us) / len(timings_us), 2),
+    }
+
+
+def _compute_multilingual_ab_summary(
+    mode_records_by_name: Dict[str, List[Dict[str, Any]]],
+    seed: int,
+) -> Dict[str, Any]:
+    """
+    Computes side-by-side Multilingual HS-Gate A/B comparison across:
+      english_only (HS-Gate) vs pooled_multilingual (HS-Gate-Pooled) vs language_routed (HS-Gate-Routed).
+    """
+    mapping = {
+        "english_only": "HS-Gate",
+        "pooled_multilingual": "HS-Gate-Pooled",
+        "language_routed": "HS-Gate-Routed",
+    }
+    ab: Dict[str, Any] = {}
+    for label, mode_name in mapping.items():
+        recs = mode_records_by_name.get(mode_name)
+        if not recs:
+            continue
+        ml_recs = [r for r in recs if r["is_attack"] and r.get("lang", "en") != "en"]
+        en_cs = [r for r in recs if r["category"] == "codespear"]
+        en_ben = [r for r in recs if not r["is_attack"]]
+
+        ml_asr, ml_lo, ml_hi = wilson_ci_95(sum(1 for r in ml_recs if r["attack_succeeded"]), len(ml_recs))
+        cs_asr, cs_lo, cs_hi = wilson_ci_95(sum(1 for r in en_cs if r["attack_succeeded"]), len(en_cs))
+        ben_fpr, ben_lo, ben_hi = wilson_ci_95(sum(1 for r in en_ben if r["false_positive"]), len(en_ben))
+
+        by_lang: Dict[str, Any] = {}
+        for lg in sorted({r.get("lang", "en") for r in ml_recs}):
+            lg_recs = [r for r in ml_recs if r.get("lang") == lg]
+            lg_asr, lg_l, lg_h = wilson_ci_95(sum(1 for r in lg_recs if r["attack_succeeded"]), len(lg_recs))
+            hs_vals = [float(r["max_hs_score"]) for r in lg_recs if r["max_hs_score"] is not None]
+            by_lang[lg] = {
+                "n": len(lg_recs),
+                "judge_asr_pct": round(lg_asr, 2),
+                "judge_asr_ci95": [round(lg_l, 2), round(lg_h, 2)],
+                "mean_hs": round(sum(hs_vals) / len(hs_vals), 4) if hs_vals else None,
+            }
+
+        ml_hs = [float(r["max_hs_score"]) for r in ml_recs if r["max_hs_score"] is not None]
+        cs_hs = [float(r["max_hs_score"]) for r in en_cs if r["max_hs_score"] is not None]
+        ben_hs = [float(r["max_hs_score"]) for r in en_ben if r["max_hs_score"] is not None]
+
+        ab[label] = {
+            "mode_name": mode_name,
+            "multilingual_codespear": {
+                "n": len(ml_recs),
+                "judge_asr_pct": round(ml_asr, 2),
+                "judge_asr_ci95": [round(ml_lo, 2), round(ml_hi, 2)],
+                "mean_hs": round(sum(ml_hs) / len(ml_hs), 4) if ml_hs else None,
+                "auroc_vs_en_benign": (
+                    bootstrap_auroc_tpr_ci(ben_hs, ml_hs, n_resamples=500, seed=seed)["auroc"]
+                    if (ben_hs and ml_hs)
+                    else None
+                ),
+                "by_lang": by_lang,
+            },
+            "english_codespear": {
+                "n": len(en_cs),
+                "judge_asr_pct": round(cs_asr, 2),
+                "judge_asr_ci95": [round(cs_lo, 2), round(cs_hi, 2)],
+                "mean_hs": round(sum(cs_hs) / len(cs_hs), 4) if cs_hs else None,
+                "auroc_vs_en_benign": (
+                    bootstrap_auroc_tpr_ci(ben_hs, cs_hs, n_resamples=500, seed=seed)["auroc"]
+                    if (ben_hs and cs_hs)
+                    else None
+                ),
+            },
+            "english_benign": {
+                "n": len(en_ben),
+                "fpr_pct": round(ben_fpr, 2),
+                "fpr_ci95": [round(ben_lo, 2), round(ben_hi, 2)],
+                "mean_hs": round(sum(ben_hs) / len(ben_hs), 4) if ben_hs else None,
+            },
+        }
+    return ab
+
+
 def evaluate_model(
     model_id: str,
     n_jsb: int = 100,
@@ -278,13 +462,15 @@ def evaluate_model(
     jbb_split: str = "all",
     max_new_tokens: int = 48,
     decode_regimes: str = "all",
+    stochastic_n: int = 25,
     seed: int = 2026,
     results_dir: Path = DEFAULT_RESULTS_DIR,
     modes_filter: Optional[Sequence[str]] = None,
+    projected_total_models: int = 3,
 ) -> Dict[str, Any]:
     """Runs the complete v1.0 principal evaluation for a single model family."""
-    assert_native_l1_ready()
-    xgr_ver = assert_xgrammar_ready()
+    t_model_wall_0 = time.perf_counter()
+    provenance = get_runtime_provenance()
     import xgrammar as xgr
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -314,10 +500,9 @@ def evaluate_model(
     compiled_json_cache: Dict[str, Any] = {}
 
     def _compile_json_cached(schema_str: str) -> Any:
-        key = schema_str
-        if key not in compiled_json_cache:
-            compiled_json_cache[key] = compiler.compile_json_schema(schema_str)
-        return compiled_json_cache[key]
+        if schema_str not in compiled_json_cache:
+            compiled_json_cache[schema_str] = compiler.compile_json_schema(schema_str)
+        return compiled_json_cache[schema_str]
 
     def _validate_json_schema(schema_str: str) -> bool:
         try:
@@ -339,20 +524,62 @@ def evaluate_model(
         manifest_path=results_dir / "dataset_manifest.json",
     )
     suites = corpus_bundle["suites"]
-    all_items: List[Dict[str, Any]] = [
+    greedy_items: List[Dict[str, Any]] = [
         item for cat in suites for item in suites[cat]
     ]
+    stochastic_items: List[Dict[str, Any]] = _select_stochastic_items(
+        suites, stochastic_n=stochastic_n
+    )
 
-    # Calibrate English and Language-Routed HS-Gate probes (strictly disjoint calibration data)
+    rust_l1_bench = _measure_rust_l1_micros(
+        [it["schema"] for it in suites.get("benign_jsb", [])[:20]]
+    )
+
+    all_modes = _build_mode_configs()
+    if modes_filter:
+        allowed = {m.strip() for m in modes_filter if m.strip()}
+        all_modes = [m for m in all_modes if m.name in allowed]
+
+    llm_mode_count = sum(1 for m in all_modes if not m.l1_only)
+    regime_specs: List[Tuple[str, float, float, int, List[Dict[str, Any]]]] = [
+        ("greedy", 0.0, 1.0, seed, greedy_items)
+    ]
+    if decode_regimes == "all":
+        for s in STOCHASTIC_SEEDS:
+            regime_specs.append(("stochastic", 0.6, 0.9, s, stochastic_items))
+
+    total_llm_gens_this_model = sum(len(items) * llm_mode_count for _, _, _, _, items in regime_specs)
+    print(
+        f"[Provenance] model={model_id} | device={provenance['device_name']} ({provenance['vram_gb']}GB) | "
+        f"torch={provenance['torch']} transformers={provenance['transformers']} xgrammar={provenance['xgrammar']} | "
+        f"grammargate_core_sha256={provenance['grammargate_core_sha256'][:12]} | "
+        f"Rust L1 p50={rust_l1_bench['p50_us']}us p95={rust_l1_bench['p95_us']}us"
+    )
+    print(
+        f"[ComputeBudget] greedy_items={len(greedy_items)} | stochastic_items_per_seed={len(stochastic_items)} "
+        f"(seeds={len(STOCHASTIC_SEEDS) if decode_regimes == 'all' else 0}) | llm_modes={llm_mode_count}/{len(all_modes)} | "
+        f"model_generations={total_llm_gens_this_model} | projected_3model_generations={total_llm_gens_this_model * projected_total_models}"
+    )
+
+    # Calibrate English-only, Pooled Multilingual, and Language-Routed HS-Gate probes
     t_cal_0 = time.perf_counter()
     hs_probe_en = HiddenStateRefusalProbe.from_model_calibration(
         model=model,
         tokenizer=tokenizer,
         multilingual=False,
     )
+    hs_probe_pooled = HiddenStateRefusalProbe.from_model_calibration(
+        model=model,
+        tokenizer=tokenizer,
+        multilingual=True,
+        layer_idx=hs_probe_en.layer_idx,
+        sweep_layers=False,
+    )
     hs_probe_routed = LanguageRoutedRefusalProbe.from_model_calibration(
         model=model,
         tokenizer=tokenizer,
+        layer_idx=hs_probe_en.layer_idx,
+        sweep_layers=False,
     )
     calibration_sec = time.perf_counter() - t_cal_0
 
@@ -360,30 +587,22 @@ def evaluate_model(
     outcome_judge = OutputComplianceJudge()
 
     # CUDA warmup pass so one-time kernel/cache compilation doesn't distort p95/p99
-    if all_items:
-        warmup_ids = tokenizer(all_items[0]["prompt"], return_tensors="pt").input_ids.to(device)
+    if greedy_items:
+        warmup_ids = tokenizer(greedy_items[0]["prompt"], return_tensors="pt").input_ids.to(device)
         with torch.no_grad():
             _ = model.generate(warmup_ids, max_new_tokens=4, do_sample=False)
         _sync_cuda(device)
 
-    all_modes = _build_mode_configs()
-    if modes_filter:
-        allowed = {m.strip() for m in modes_filter if m.strip()}
-        all_modes = [m for m in all_modes if m.name in allowed]
-
-    regime_specs: List[Tuple[str, float, float, int]] = [("greedy", 0.0, 1.0, seed)]
-    if decode_regimes == "all":
-        for s in (101, 202, 303):
-            regime_specs.append(("stochastic", 0.6, 0.9, s))
-
     results_dir.mkdir(parents=True, exist_ok=True)
     slug = _model_slug(model_id)
     summary_by_regime: Dict[str, Any] = {}
+    total_llm_gens_executed = 0
 
-    for regime_name, temp, top_p, r_seed in regime_specs:
+    for regime_name, temp, top_p, r_seed, active_items in regime_specs:
         raw_path = results_dir / f"raw_{slug}_{regime_name}_s{r_seed}.jsonl"
         records: List[Dict[str, Any]] = []
         mode_summaries: Dict[str, Any] = {}
+        mode_records_by_name: Dict[str, List[Dict[str, Any]]] = {}
         baseline_tps_list: List[float] = []
 
         for mode_cfg in all_modes:
@@ -391,13 +610,16 @@ def evaluate_model(
             if mode_cfg.hs_mode == "english":
                 probe_obj = hs_probe_en
                 probe_obj.attach(model)
+            elif mode_cfg.hs_mode == "pooled":
+                probe_obj = hs_probe_pooled
+                probe_obj.attach(model)
             elif mode_cfg.hs_mode == "routed":
                 probe_obj = hs_probe_routed
                 probe_obj.attach(model)
 
             mode_records: List[Dict[str, Any]] = []
             try:
-                for item in all_items:
+                for item in active_items:
                     _set_seed(r_seed + sum(ord(c) for c in item["id"]) % 997)
                     if mode_cfg.hs_mode == "routed" and probe_obj is not None:
                         probe_obj.set_prompt(item["raw_user_prompt"])
@@ -477,8 +699,6 @@ def evaluate_model(
 
                         proc = None
                         if mode_cfg.unguarded:
-                            from transformers import LogitsProcessor
-
                             class _XGrammarOnlyProcessor(LogitsProcessor):
                                 def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
                                     if input_ids.shape[1] > in_len:
@@ -512,6 +732,7 @@ def evaluate_model(
                             out_ids = model.generate(enc["input_ids"], **gen_kwargs)
                         _sync_cuda(device)
                         wall_ms = (time.perf_counter() - t_gen_0) * 1000.0 + l1_ms
+                        total_llm_gens_executed += 1
 
                         gen_ids = out_ids[0, in_len:].tolist()
                         n_tok = max(1, len(gen_ids))
@@ -599,7 +820,7 @@ def evaluate_model(
                 if probe_obj is not None:
                     probe_obj.detach()
 
-            # Summarize per-mode stats
+            mode_records_by_name[mode_cfg.name] = mode_records
             benign_recs = [r for r in mode_records if not r["is_attack"]]
             attack_recs = [r for r in mode_records if r["is_attack"]]
             if mode_cfg.unguarded:
@@ -661,6 +882,14 @@ def evaluate_model(
                 throughput_tok_s=[r["tok_per_sec"] for r in mode_records if r["tok_per_sec"] > 0],
                 baseline_tok_s=None if mode_cfg.unguarded else baseline_tps_list,
             )
+            pure_gate_lat = summarize_latency_distribution(
+                per_token_ms=[
+                    r["l2_ms_tok"] + r["hs_ms_tok"] + r["speclook_ms_tok"] + r["l3_ms_tok"]
+                    for r in mode_records
+                    if not (mode_cfg.l1_only or r["trip_source"] == "L1+Semantic")
+                ],
+                throughput_tok_s=[r["tok_per_sec"] for r in mode_records if r["tok_per_sec"] > 0],
+            )
 
             roc_metrics: Dict[str, Any] = {
                 "refusal_suppression": bootstrap_auroc_tpr_ci(
@@ -695,6 +924,7 @@ def evaluate_model(
                 "by_attack_strategy": by_strategy,
                 "roc_bootstrap": roc_metrics,
                 "latency": lat_stats,
+                "pure_gate_latency": pure_gate_lat,
                 "component_means_ms_tok": {
                     "l1_ms_per_req": round(sum(r["l1_ms"] for r in mode_records) / max(1, len(mode_records)), 4),
                     "xgrammar_ms_tok": round(sum(r["xgrammar_ms_tok"] for r in mode_records) / max(1, len(mode_records)), 4),
@@ -716,20 +946,36 @@ def evaluate_model(
 
         summary_by_regime[f"{regime_name}_s{r_seed}"] = {
             "raw_jsonl": raw_ref,
+            "n_items": len(active_items),
             "modes": mode_summaries,
+            "multilingual_ab": _compute_multilingual_ab_summary(mode_records_by_name, seed=r_seed),
         }
+
+    total_wall_sec = time.perf_counter() - t_model_wall_0
+    sec_per_llm_gen = total_wall_sec / max(1, total_llm_gens_executed)
+    # Full 3-model projection: 650 greedy + 175 * 3 stochastic = 1175 item-passes * 7 LLM modes = 8225 gens/model
+    full_gens_per_model = 1175 * max(1, llm_mode_count)
+    proj_sec_per_model = sec_per_llm_gen * full_gens_per_model
+    proj_sec_total = proj_sec_per_model * projected_total_models
 
     model_summary = {
         "model": model_id,
-        "device": str(device),
+        "provenance": provenance,
         "dtype": str(dtype),
-        "xgrammar_version": xgr_ver,
         "vocab_size": vocab_size,
         "calibration_time_sec": round(calibration_sec, 3),
         "shared_hs_layer_idx": hs_probe_en.layer_idx,
         "routed_languages": hs_probe_routed.languages,
+        "rust_l1_microbenchmark": rust_l1_bench,
         "corpus_sha256": corpus_bundle["manifest"]["corpus_sha256"],
         "corpus_counts": corpus_bundle["manifest"]["counts"],
+        "compute_stats": {
+            "total_wall_sec": round(total_wall_sec, 2),
+            "llm_generations_executed": total_llm_gens_executed,
+            "sec_per_llm_generation": round(sec_per_llm_gen, 4),
+            "projected_full_sweep_hours_sequential": round(proj_sec_total / 3600.0, 2),
+            "projected_full_sweep_hours_parallel_3x": round(proj_sec_per_model / 3600.0, 2),
+        },
         "regimes": summary_by_regime,
     }
     summary_path = results_dir / f"summary_{slug}.json"
@@ -757,6 +1003,12 @@ def main() -> None:
     parser.add_argument("--jbb-split", type=str, default="all", choices=["all", "eval80"])
     parser.add_argument("--max-new-tokens", type=int, default=48)
     parser.add_argument("--decode-regimes", type=str, default="all", choices=["greedy", "all"])
+    parser.add_argument(
+        "--stochastic-n",
+        type=int,
+        default=25,
+        help="Stratified subset size per category for each stochastic seed (prevents multi-seed compute explosion)",
+    )
     parser.add_argument("--modes", type=str, default="", help="Optional comma-separated subset of modes")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--results-dir", type=str, default=str(DEFAULT_RESULTS_DIR))
@@ -768,6 +1020,7 @@ def main() -> None:
 
     report: Dict[str, Any] = {
         "version": "1.0.0",
+        "provenance": get_runtime_provenance(),
         "models": {},
     }
     for model_id in models:
@@ -780,9 +1033,11 @@ def main() -> None:
             jbb_split=args.jbb_split,
             max_new_tokens=args.max_new_tokens,
             decode_regimes=args.decode_regimes,
+            stochastic_n=args.stochastic_n,
             seed=args.seed,
             results_dir=results_dir,
             modes_filter=modes_filter,
+            projected_total_models=max(1, len(models)),
         )
         report["models"][model_id] = res
 

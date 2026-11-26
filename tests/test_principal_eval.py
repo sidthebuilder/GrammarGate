@@ -142,6 +142,48 @@ def test_public_corpus_v1_zero_overlap_and_manifest(tmp_path: Path):
     assert bundle["manifest"]["calibration_disjointness"]["ngram_matches"] == 0
     assert manifest_tmp.exists()
 
+    from benchmarks.run_principal_eval import (
+        DEFAULT_MODELS,
+        _compute_multilingual_ab_summary,
+        _select_stochastic_items,
+    )
+
+    assert DEFAULT_MODELS == (
+        "Qwen/Qwen3-4B-Instruct-2507",
+        "microsoft/Phi-4-mini-instruct",
+        "allenai/OLMo-2-1124-7B-Instruct",
+    )
+    assert "mistralai/Mistral-7B-Instruct-v0.3" not in DEFAULT_MODELS
+
+    stochastic_sub = _select_stochastic_items(bundle["suites"], stochastic_n=25)
+    assert len(stochastic_sub) == 175
+    jsb_sub = {it["subset"] for it in stochastic_sub if it["category"] == "benign_jsb"}
+    assert len(jsb_sub) == 5
+    ml_langs = {it["lang"] for it in stochastic_sub if it["category"] == "adaptive" and it["lang"] != "en"}
+    assert ml_langs == {"es", "fr", "hi", "zh"}
+
+    fake_recs = {
+        "HS-Gate": [
+            {"category": "codespear", "is_attack": True, "lang": "en", "attack_succeeded": False, "false_positive": False, "max_hs_score": 0.3},
+            {"category": "adaptive", "is_attack": True, "lang": "hi", "attack_succeeded": True, "false_positive": False, "max_hs_score": -0.1},
+            {"category": "benign_jsb", "is_attack": False, "lang": "en", "attack_succeeded": False, "false_positive": False, "max_hs_score": -0.2},
+        ],
+        "HS-Gate-Pooled": [
+            {"category": "codespear", "is_attack": True, "lang": "en", "attack_succeeded": True, "false_positive": False, "max_hs_score": 0.02},
+            {"category": "adaptive", "is_attack": True, "lang": "hi", "attack_succeeded": False, "false_positive": False, "max_hs_score": 0.2},
+            {"category": "benign_jsb", "is_attack": False, "lang": "en", "attack_succeeded": False, "false_positive": False, "max_hs_score": -0.05},
+        ],
+        "HS-Gate-Routed": [
+            {"category": "codespear", "is_attack": True, "lang": "en", "attack_succeeded": False, "false_positive": False, "max_hs_score": 0.3},
+            {"category": "adaptive", "is_attack": True, "lang": "hi", "attack_succeeded": False, "false_positive": False, "max_hs_score": 0.4},
+            {"category": "benign_jsb", "is_attack": False, "lang": "en", "attack_succeeded": False, "false_positive": False, "max_hs_score": -0.2},
+        ],
+    }
+    ab = _compute_multilingual_ab_summary(fake_recs, seed=2026)
+    assert set(ab.keys()) == {"english_only", "pooled_multilingual", "language_routed"}
+    assert ab["language_routed"]["multilingual_codespear"]["judge_asr_pct"] == 0.0
+    assert ab["english_only"]["multilingual_codespear"]["judge_asr_pct"] == 100.0
+
 
 def test_language_routing_and_qwen05b_ab_separation():
     expected = ["en", "es", "fr", "hi", "zh"]
@@ -277,7 +319,7 @@ def test_xgrammar_native_real_jsb_and_principal_eval_smoke(tmp_path: Path):
     assert len(jsb_items) == 25
     assert sum(jsb_stats["per_subset"].values()) == 25
 
-    # End-to-end live principal smoke evaluation across all 7 modes on Qwen2.5-0.5B-Instruct
+    # End-to-end live principal smoke evaluation across all 8 modes (incl. Multilingual A/B) on Qwen2.5-0.5B
     summary = evaluate_model(
         model_id="Qwen/Qwen2.5-0.5B-Instruct",
         n_jsb=1,
@@ -287,14 +329,22 @@ def test_xgrammar_native_real_jsb_and_principal_eval_smoke(tmp_path: Path):
         decode_regimes="greedy",
         results_dir=tmp_path,
     )
-    greedy_modes = summary["regimes"]["greedy_s2026"]["modes"]
+    greedy_reg = summary["regimes"]["greedy_s2026"]
+    greedy_modes = greedy_reg["modes"]
     assert set(greedy_modes.keys()) == {
         "Unguarded",
         "Static-L1-Only",
         "Lexical-L2",
         "SpecLook-Gate",
         "HS-Gate",
+        "HS-Gate-Pooled",
         "HS-Gate-Routed",
         "Combined",
     }
+    assert set(greedy_reg["multilingual_ab"].keys()) == {
+        "english_only",
+        "pooled_multilingual",
+        "language_routed",
+    }
+    assert summary["rust_l1_microbenchmark"]["p50_us"] > 0.0
     assert (tmp_path / "summary_Qwen__Qwen2.5-0.5B-Instruct.json").exists()

@@ -4,7 +4,9 @@ Prevents silent fallback to pure-Python heuristics or synthetic token masks in e
 """
 
 from __future__ import annotations
+import hashlib
 import importlib.metadata
+from pathlib import Path
 import re
 
 MIN_XGRAMMAR_VERSION: tuple[int, int, int] = (0, 2, 9)
@@ -38,6 +40,18 @@ def assert_native_l1_ready() -> None:
 
     if rep.is_elevated:
         raise RuntimeError("Native Rust L1 sanity check unexpectedly flagged a benign multi-option enum schema.")
+
+
+def get_native_l1_info() -> dict[str, str]:
+    """Returns loaded native Rust core library path and SHA-256 digest."""
+    import grammargate_core
+
+    lib = getattr(grammargate_core, "_LIB", None)
+    lib_name = str(getattr(lib, "_name", "") or "")
+    sha256 = "unknown"
+    if lib_name and Path(lib_name).is_file():
+        sha256 = hashlib.sha256(Path(lib_name).read_bytes()).hexdigest()
+    return {"path": lib_name, "sha256": sha256}
 
 
 def assert_xgrammar_ready(min_version: tuple[int, ...] = MIN_XGRAMMAR_VERSION) -> str:

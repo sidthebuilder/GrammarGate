@@ -179,7 +179,7 @@ Latest verified CPU timings after the single-sync sparse `ref_indices` optimizat
 | **Mechanism 1 (`SpecLook`)** | Strict/ambiguous partition + private KV-cache `crop(-1)` rollback verified on `Qwen2.5-0.5B` (`0.0%` Benign FPR, `4.7%` spec rate) | Alone allows `80.0%` CodeSpear ASR and `100.0%` Enum/Dict ASR |
 | **Mechanism 2 (`HS-Gate`)** | Cuts CodeSpear ASR & Benign FPR to `0.0%` on `Qwen2.5-0.5B` (`N=5/cat`); `LanguageRoutedRefusalProbe` preserves exact English benign separation (`< 1e-4` delta) while boosting non-English CodeSpear refusal scores (e.g., `+0.25+` on Hindi `JBB_15` on `Qwen2.5-0.5B`) | Single linear EN direction misses non-English `adaptive_multilingual_2` / Hindi; single pooled multilingual direction hurts EN CodeSpear (`0.0% -> 40.0%` ASR); `N >= 100` multi-model GPU sweeps with `LanguageRoutedRefusalProbe` await Modal GPU execution |
 | **Mechanism 3 (`Plane-Sync`)** | Catches fragmented `dict_frag_1..5` (`trip_source: "L3"`) + `finalize()` trailing-buffer flush verified | Semantic judge relies on lightweight cluster rules + optional MiniLM embeddings |
-| **Scale & Model Coverage** | `Qwen2.5-0.5B` CPU ablation (`N=5/cat`), `Qwen2.5-3B` baseline GPU smoke (`N=10/cat`), vLLM V1 slot lifecycle unit tests; zero-synthetic v1.0 HF corpus ([corpus_v1.py](benchmarks/corpus_v1.py), 650 items, SHA-256 [`dataset_manifest.json`](benchmarks/results_v1/dataset_manifest.json)) with 0 5-gram calibration overlap verified | Full multi-model GPU sweeps across `Qwen/Qwen3-4B-Instruct-2507`, `microsoft/Phi-4-mini-instruct`, and `mistralai/Mistral-7B-Instruct-v0.3` ([run_principal_eval.py](benchmarks/run_principal_eval.py) / [modal_vllm_eval.py](benchmarks/modal_vllm_eval.py)) are ready to run but have not yet been executed on CUDA/Modal |
+| **Scale & Model Coverage** | `Qwen2.5-0.5B` CPU ablation (`N=5/cat`), `Qwen2.5-3B` baseline GPU smoke (`N=10/cat`), vLLM V1 slot lifecycle unit tests; zero-synthetic v1.0 HF corpus ([corpus_v1.py](benchmarks/corpus_v1.py), 650 items, SHA-256 [`dataset_manifest.json`](benchmarks/results_v1/dataset_manifest.json)) with 0 5-gram calibration overlap verified | Full multi-model GPU sweeps across `Qwen/Qwen3-4B-Instruct-2507`, `microsoft/Phi-4-mini-instruct`, and `allenai/OLMo-2-1124-7B-Instruct` ([run_principal_eval.py](benchmarks/run_principal_eval.py) / [modal_vllm_eval.py](benchmarks/modal_vllm_eval.py)) are ready to run cleanly (`--smoke` + `--stochastic-n 25`) but have not yet been executed on CUDA/Modal |
 
 ---
 
@@ -232,12 +232,15 @@ python benchmarks/run_ablation_and_adaptive.py \
     --require-xgrammar \
     --output benchmarks/results_ablation_05b.jsonl
 
-# Principal v1.0 zero-synthetic multi-model CUDA + XGrammar evaluation (greedy + stochastic 3-seed sweep):
+# Principal v1.0 zero-synthetic multi-model CUDA + XGrammar evaluation (full greedy + capped N=25/cat stochastic 3-seed sweep):
 python benchmarks/run_principal_eval.py \
-    --models Qwen/Qwen3-4B-Instruct-2507,microsoft/Phi-4-mini-instruct,mistralai/Mistral-7B-Instruct-v0.3 \
-    --n-jsb 100 --n-humaneval 100 --n-jbb 100 --decode-regimes all
+    --models Qwen/Qwen3-4B-Instruct-2507,microsoft/Phi-4-mini-instruct,allenai/OLMo-2-1124-7B-Instruct \
+    --n-jsb 100 --n-humaneval 100 --n-jbb 100 --decode-regimes all --stochastic-n 25
 
-# Cloud A10G / H100 XGrammar v1.0 sweep across ungated model families via Modal:
+# Fast Modal A10G preflight smoke check (Qwen3-4B, N=5/cat, greedy):
+modal run benchmarks/modal_vllm_eval.py --smoke
+
+# Full Modal A10G / H100 XGrammar v1.0 sweep across ungated model families:
 modal run benchmarks/modal_vllm_eval.py --gpu A10G
 ```
 

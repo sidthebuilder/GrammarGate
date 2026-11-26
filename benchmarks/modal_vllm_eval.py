@@ -1,10 +1,10 @@
 """
 Modal GPU deployment wrapper for GrammarGate v1.0 Multi-Model Evaluation on A10G / H100.
 
-Enforces zero fallbacks (`--require-native-l1` and `--require-xgrammar`), builds the native
-Rust `cdylib`, verifies `cargo test`, downloads public HF corpora & models into a persistent
-Modal Volume, runs `benchmarks/run_principal_eval.py` across ungated model families, and
-saves local JSON/JSONL artifacts into `benchmarks/results_v1/`.
+Enforces zero fallbacks (native Rust Layer 1 + XGrammar 0.2.9), builds and tests the native
+Rust `cdylib` inside the image, caches HF models in a persistent Modal Volume, supports a
+fast `--smoke` preflight run, and collects raw JSONL traces + statistical summaries under
+`benchmarks/results_v1/`.
 """
 
 from __future__ import annotations
@@ -22,8 +22,9 @@ except ImportError:
 DEFAULT_PRINCIPAL_MODELS = (
     "Qwen/Qwen3-4B-Instruct-2507,"
     "microsoft/Phi-4-mini-instruct,"
-    "mistralai/Mistral-7B-Instruct-v0.3"
+    "allenai/OLMo-2-1124-7B-Instruct"
 )
+A10G_HOURLY_USD = 1.10
 
 if modal is not None:
     app = modal.App("grammargate-v1-principal-eval")
@@ -39,11 +40,10 @@ if modal is not None:
             "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
         })
         .pip_install(
-            "torch>=2.4.0",
-            "transformers>=4.48.0",
+            "torch>=2.5.0",
+            "transformers>=4.51.0",
             "accelerate>=0.34.0",
-            "xgrammar>=0.2.9",
-            "vllm>=0.7.0",
+            "xgrammar==0.2.9",
             "datasets>=2.20.0",
             "huggingface_hub>=0.25.0",
             "pyarrow>=15.0.0",
@@ -52,7 +52,24 @@ if modal is not None:
             "pytest",
             "numpy",
         )
-        .add_local_dir(".", remote_path="/workspace")
+        .add_local_dir(
+            ".",
+            remote_path="/workspace",
+            ignore=[
+                "hf_cache",
+                "hf_cache/**",
+                ".git",
+                ".git/**",
+                ".pytest_cache",
+                ".pytest_cache/**",
+                "**/__pycache__",
+                "target",
+                "target/**",
+                "grammargate_core/target",
+                "grammargate_core/target/**",
+                "benchmarks/results_*.jsonl",
+            ],
+        )
         .run_commands(
             "cd /workspace && cargo test --manifest-path grammargate_core/Cargo.toml --verbose",
             "cd /workspace && cargo build --release --manifest-path grammargate_core/Cargo.toml",
@@ -69,16 +86,19 @@ if modal is not None:
         jbb_split: str,
         max_new_tokens: int,
         decode_regimes: str,
+        stochastic_n: int,
         seed: int,
     ) -> dict:
         import sys
         sys.path.insert(0, "/workspace")
 
-        from grammargate.native_checks import assert_native_l1_ready, assert_xgrammar_ready
-        assert_native_l1_ready()
-        assert_xgrammar_ready()
+        from benchmarks.run_principal_eval import evaluate_model, get_runtime_provenance
 
-        from benchmarks.run_principal_eval import evaluate_model
+        prov = get_runtime_provenance()
+        print(
+            "[Modal Startup] versions:",
+            json.dumps({k: prov[k] for k in ("torch", "transformers", "xgrammar", "device_name", "grammargate_core_sha256")}),
+        )
 
         res_dir = Path("/workspace/benchmarks/results_v1")
         summary = evaluate_model(
@@ -89,6 +109,7 @@ if modal is not None:
             jbb_split=jbb_split,
             max_new_tokens=max_new_tokens,
             decode_regimes=decode_regimes,
+            stochastic_n=stochastic_n,
             seed=seed,
             results_dir=res_dir,
         )
@@ -110,7 +131,7 @@ if modal is not None:
     @app.function(
         image=image,
         gpu="A10G",
-        timeout=10800,
+        timeout=14400,
         volumes={"/cache/hf": hf_cache_vol},
     )
     def run_modal_principal_a10g(
@@ -121,90 +142,88 @@ if modal is not None:
         jbb_split: str = "all",
         max_new_tokens: int = 48,
         decode_regimes: str = "all",
+        stochastic_n: int = 25,
         seed: int = 2026,
     ) -> dict:
         return _run_principal_worker(
-            model_id, n_jsb, n_humaneval, n_jbb, jbb_split, max_new_tokens, decode_regimes, seed
+            model_id, n_jsb, n_humaneval, n_jbb, jbb_split, max_new_tokens, decode_regimes, stochastic_n, seed
         )
 
     @app.function(
         image=image,
         gpu="H100",
-        timeout=7200,
+        timeout=10800,
         volumes={"/cache/hf": hf_cache_vol},
     )
     def run_modal_principal_h100(
-        model_id: str = "mistralai/Mistral-7B-Instruct-v0.3",
+        model_id: str = "allenai/OLMo-2-1124-7B-Instruct",
         n_jsb: int = 100,
         n_humaneval: int = 100,
         n_jbb: int = 100,
         jbb_split: str = "all",
         max_new_tokens: int = 48,
         decode_regimes: str = "all",
+        stochastic_n: int = 25,
         seed: int = 2026,
     ) -> dict:
         return _run_principal_worker(
-            model_id, n_jsb, n_humaneval, n_jbb, jbb_split, max_new_tokens, decode_regimes, seed
+            model_id, n_jsb, n_humaneval, n_jbb, jbb_split, max_new_tokens, decode_regimes, stochastic_n, seed
         )
-
-    @app.function(
-        image=image,
-        gpu="A10G",
-        timeout=3600,
-        volumes={"/cache/hf": hf_cache_vol},
-    )
-    def run_modal_ablation(
-        model_id: str = "Qwen/Qwen2.5-3B-Instruct",
-        n_per_category: int = 50,
-        multilingual_calibration: bool = False,
-    ):
-        import sys
-        sys.path.insert(0, "/workspace")
-
-        from grammargate.native_checks import assert_native_l1_ready, assert_xgrammar_ready
-        assert_native_l1_ready()
-        assert_xgrammar_ready()
-
-        from benchmarks.run_ablation_and_adaptive import run_ablation
-        safe_slug = model_id.replace("/", "_")
-        out_path = f"/workspace/benchmarks/results_modal_{safe_slug}.jsonl"
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        res = run_ablation(
-            model_id=model_id,
-            n_per_category=max(50, int(n_per_category)),
-            mask_backend="xgrammar",
-            max_new_tokens=25,
-            output_jsonl=out_path,
-            require_native_l1=True,
-            require_xgrammar=True,
-            multilingual_calibration=multilingual_calibration,
-        )
-        hf_cache_vol.commit()
-        return res
 
     @app.local_entrypoint()
     def main(
         models: str = DEFAULT_PRINCIPAL_MODELS,
         gpu: str = "A10G",
+        smoke: bool = False,
         n_jsb: int = 100,
         n_humaneval: int = 100,
         n_jbb: int = 100,
         jbb_split: str = "all",
         max_new_tokens: int = 48,
         decode_regimes: str = "all",
+        stochastic_n: int = 25,
         seed: int = 2026,
-        legacy_ablation: bool = False,
     ):
-        targets = [m.strip() for m in models.split(",") if m.strip()]
-        if legacy_ablation:
-            for target in targets:
-                res = run_modal_ablation.remote(model_id=target)
-                print(f"Legacy modal ablation ({target}):", res)
+        worker = run_modal_principal_h100 if gpu.upper() == "H100" else run_modal_principal_a10g
+
+        if smoke:
+            smoke_model = "Qwen/Qwen3-4B-Instruct-2507"
+            out = worker.remote(
+                model_id=smoke_model,
+                n_jsb=5,
+                n_humaneval=5,
+                n_jbb=5,
+                jbb_split=jbb_split,
+                max_new_tokens=32,
+                decode_regimes="greedy",
+                stochastic_n=0,
+                seed=seed,
+            )
+            summary = out["summary"]
+            reg_key = next(iter(summary["regimes"].keys()))
+            modes = summary["regimes"][reg_key]["modes"]
+            comb = modes.get("Combined", {})
+            hs_m = modes.get("HS-Gate-Routed", {})
+            cstats = summary["compute_stats"]
+            est_hours_seq = cstats["projected_full_sweep_hours_sequential"]
+            est_cost_usd = round(est_hours_seq * A10G_HOURLY_USD, 2)
+            print("=== MODAL SMOKE REPORT ===")
+            print("Provenance:", json.dumps(summary["provenance"], indent=2))
+            print("Native Rust L1 (µs):", summary["rust_l1_microbenchmark"])
+            print("Combined latency (ms/tok):", comb.get("latency"))
+            print("Combined pure_gate_latency (ms/tok):", comb.get("pure_gate_latency"))
+            print("HS-Gate-Routed pure_gate_latency (ms/tok):", hs_m.get("pure_gate_latency"))
+            print("Combined component means (ms/tok):", comb.get("component_means_ms_tok"))
+            print("Compute projection:", cstats, f"est_A10G_cost_usd~=${est_cost_usd}")
+            local_results_dir = Path("benchmarks") / "results_v1"
+            local_results_dir.mkdir(parents=True, exist_ok=True)
+            with open(local_results_dir / "smoke_qwen3_4b.json", "w", encoding="utf-8") as sf:
+                json.dump(summary, sf, indent=2)
             return
 
-        worker = run_modal_principal_h100 if gpu.upper() == "H100" else run_modal_principal_a10g
+        targets = [m.strip() for m in models.split(",") if m.strip()]
         args_list = [
-            (m, n_jsb, n_humaneval, n_jbb, jbb_split, max_new_tokens, decode_regimes, seed)
+            (m, n_jsb, n_humaneval, n_jbb, jbb_split, max_new_tokens, decode_regimes, stochastic_n, seed)
             for m in targets
         ]
         local_results_dir = Path("benchmarks") / "results_v1"
