@@ -155,7 +155,8 @@ def _cross_plane_forced_json_block(
             return True
         if semantic_judge is not None and len(clean) >= 8:
             try:
-                if semantic_judge.evaluate_text(clean).unsafe:
+                is_harm, _ = semantic_judge.evaluate(clean)
+                if is_harm:
                     return True
             except Exception:
                 pass
@@ -227,21 +228,37 @@ def _build_mode_configs() -> List[EvalModeConfig]:
 class TimedGrammarMatcher:
     """Wraps xgrammar.GrammarMatcher to isolate XGrammar bitmask fill+advance latency."""
 
-    def __init__(self, compiled_grammar: Any, vocab_size: int, xgr_module: Any):
+    def __init__(
+        self,
+        compiled_grammar: Any,
+        vocab_size: int,
+        xgr_module: Any,
+        eos_token_id: Optional[int] = None,
+    ):
         self._matcher = xgr_module.GrammarMatcher(compiled_grammar)
         self._bitmask = xgr_module.allocate_token_bitmask(1, vocab_size)
         self._vocab_size = vocab_size
+        self._eos_token_id = eos_token_id
         self.mask_time_sec: float = 0.0
 
     def next_bitmask(self, _step: int, _vocab_size: int) -> torch.Tensor:
         t0 = time.perf_counter()
         self._bitmask.zero_()
-        self._matcher.fill_next_token_bitmask(self._bitmask)
+        if self._matcher.is_terminated():
+            if self._eos_token_id is not None and 0 <= self._eos_token_id < self._vocab_size:
+                word_idx = self._eos_token_id // 32
+                bit_idx = self._eos_token_id % 32
+                self._bitmask[0, word_idx] = 1 << bit_idx
+        else:
+            self._matcher.fill_next_token_bitmask(self._bitmask)
         self.mask_time_sec += time.perf_counter() - t0
         return self._bitmask
 
     def accept_token(self, token_id: int) -> bool:
         t0 = time.perf_counter()
+        if self._matcher.is_terminated():
+            self.mask_time_sec += time.perf_counter() - t0
+            return token_id == self._eos_token_id
         try:
             ok = self._matcher.accept_token(int(token_id))
         except Exception:
@@ -433,14 +450,16 @@ def evaluate_model(
                             if item["mode"] == "json"
                             else compiled_python_cfg
                         )
-                        timed_matcher = TimedGrammarMatcher(compiled_grammar, vocab_size, xgr)
+                        timed_matcher = TimedGrammarMatcher(
+                            compiled_grammar, vocab_size, xgr, eos_token_id=tokenizer.eos_token_id
+                        )
 
                         escalator = None
                         if mode_cfg.use_plane_sync_l3:
                             escalator = RollingEscalator(
                                 tokenizer=tokenizer,
-                                judge=semantic_judge,
-                                check_interval=4,
+                                semantic_judge=semantic_judge,
+                                check_interval_tokens=4,
                             )
 
                         enc = tokenizer(item["prompt"], return_tensors="pt").to(device)
