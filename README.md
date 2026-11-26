@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Interactive Showcase](https://img.shields.io/badge/Interactive%20Report-Live%20Demo-emerald)](https://sidthebuilder.github.io/GrammarGate/)
 
-GrammarGate is an inference-time safety research prototype and multi-plane defense architecture against Constrained Decoding Attacks (CDA) — including **EnumAttack**, **DictAttack** (and fragmented/stealth variants), **CodeSpear**, and adaptive evasion payloads — without retraining model weights.
+GrammarGate is an inference-time safety research prototype and multi-plane defense architecture against Constrained Decoding Attacks (CDA), including **EnumAttack**, **DictAttack** (and fragmented/stealth variants), **CodeSpear**, and adaptive evasion payloads, without retraining model weights.
 
 > **Explore the Visual Demo:** Initial prototype findings and the token extinction trace inspector are hosted on [GitHub Pages](https://sidthebuilder.github.io/GrammarGate/) (source in [index.html](index.html)). See the sections below for the `SpecLook-Gate`, `HS-Gate`, and `Plane-Sync` upgrades, updated ablation benchmarks, and honest verification boundaries.
 
@@ -58,10 +58,10 @@ User Prompt + Schema/CFG
 
 ### Key Research Mechanisms
 
-- **Mechanism 1 — `SpecLook-Gate` ([refusal_tokens.py](grammargate/refusal_tokens.py), [gate.py](grammargate/gate.py), [hf_processor.py](grammargate/adapters/hf_processor.py)):**
+- **Mechanism 1: `SpecLook-Gate` ([refusal_tokens.py](grammargate/refusal_tokens.py), [gate.py](grammargate/gate.py), [hf_processor.py](grammargate/adapters/hf_processor.py)):**
   - Partitions refusal tokens into unambiguous `strict_refusal_ids` (`"sorry"`, `"cannot"`, `"unable"`), overloaded unigram `ambiguous_onset_ids` (`"I"`, `"It"`, `"As"`), and `benign_transition_ids` (`"Sure"`, `"Here"`, `"#"`, `"```"`).
   - When `ambiguous_onset_ids` mass crosses threshold and exceeds suppressed benign transitions, `CachedPrefixLookahead` runs a read-only 1-token forward pass over a private KV cache and rolls back cleanly (`DynamicCache.crop(-1)`), checking conditional and joint continuation probabilities before tripping.
-- **Mechanism 2 — `HS-Gate` ([hs_probe.py](grammargate/hs_probe.py)):**
+- **Mechanism 2: `HS-Gate` ([hs_probe.py](grammargate/hs_probe.py)):**
   - Training-free frozen difference-in-means residual-stream probe calibrated on held-out harmful vs. benign prompts (`DEFAULT_CALIBRATION_HARMFUL` / `DEFAULT_CALIBRATION_BENIGN`, automatic Fisher $d$-prime layer selection, plus `format_chat_prompt` supporting ChatML/Qwen, `Qwen3` `enable_thinking=False`, and native `apply_chat_template` models such as Phi-4 and Mistral).
   - Includes `LanguageRoutedRefusalProbe` and `detect_prompt_language` (`en`, `es`, `fr`, `hi`, `zh`) isolating per-language normalized directions at a single shared layer so non-English separation strengthens without cross-lingual vector dilution on English benign tasks.
   - Evaluates centered cosine projection `hs_score` in $O(d_{\text{model}})$ and combines it with XGrammar mask clipping in a 2×2 Mask-Divergence Matrix:
@@ -69,7 +69,7 @@ User Prompt + Schema/CFG
     - **High Clipping + High `hs_score` ($\ge 0.05$):** Block (`HIGH_CLIP_HIGH_HS`, catches CodeSpear).
     - **High Clipping + Low `hs_score` ($< 0.0$):** Allow (`HIGH_CLIP_LOW_HS`, overrides false lexical/prose trips on benign strict CFGs).
     - **Low Clipping + High `hs_score` ($\ge 0.12$):** Block / escalate L3 (`LOW_CLIP_HIGH_HS`).
-- **Mechanism 3 — `Plane-Sync` ([grammargate_core/src/](grammargate_core/src), [escalator.py](grammargate/escalator.py)):**
+- **Mechanism 3: `Plane-Sync` ([grammargate_core/src/](grammargate_core/src), [escalator.py](grammargate/escalator.py)):**
   - Hardens Layer 1 Rust AST parsing against `#/` `$ref`/`$defs` indirection, `\uXXXX` + UTF-16 surrogate escapes, rigid `pattern` literals, and EBNF `#`/`//` comments while preserving multi-option benign API `enum`s (`severity`, `http_status`, `ticket_category`).
   - Normalizes generated prefix leaves across `unescaped_raw`, `values_spaced`, and delimiter-stripped `values_joined` views, and flushes trailing fragments via `finalize()`.
   - Note: For strict CI/GPU benchmarking, pass `--require-native-l1` and `--require-xgrammar` (enforced unconditionally in [modal_vllm_eval.py](benchmarks/modal_vllm_eval.py) and by default on Linux/WSL2) so missing native extensions fail loudly instead of silently using pure-Python fallbacks.
@@ -161,7 +161,7 @@ DictAttack       | 10       | 100.0%         | 100.0%             | 3009.27 ms/t
 ```
 
 > **Methodological Notes on [results_real_3b.jsonl](benchmarks/results_real_3b.jsonl) vs. Updated [run_real_eval.py](benchmarks/run_real_eval.py):**
-> - In that initial 40-task GPU run, `dict_1`–`dict_10` tripped at step 0 via Layer 2 (`l1_risk_score: 0.63`), and 2/10 benign un-fenced Python tasks (`benign_py_3`, `benign_py_5`) false-tripped under the unpartitioned `0.01` threshold (`20.0%` FPR) — motivating `SpecLook-Gate`, `HS-Gate`, and the new `STEALTH_DICT_ATTACK_TASKS`.
+> - In that initial 40-task GPU run, `dict_1`–`dict_10` tripped at step 0 via Layer 2 (`l1_risk_score: 0.63`), and 2/10 benign un-fenced Python tasks (`benign_py_3`, `benign_py_5`) false-tripped under the unpartitioned `0.01` threshold (`20.0%` FPR), motivating `SpecLook-Gate`, `HS-Gate`, and the new `STEALTH_DICT_ATTACK_TASKS`.
 > - [run_real_eval.py](benchmarks/run_real_eval.py) now includes 10 low-refusal `STEALTH_DICT_ATTACK_TASKS`, symmetric benign telemetry (`_telemetry_fields`), and `compute_auroc_and_tpr_at_fpr()`, **but this updated 50-task script has not yet been re-executed on CUDA** because no CUDA GPU or unblocked `xgrammar` wheel was attached to the latest CPU host.
 
 ---
