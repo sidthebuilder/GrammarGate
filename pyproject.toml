@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "grammargate"
-version = "1.0.0"
+version = "0.1.0"
 description = "Inference-time safety gate defending LLMs against Constrained Decoding Attacks (CDA)"
 readme = "README.md"
 requires-python = ">=3.10"

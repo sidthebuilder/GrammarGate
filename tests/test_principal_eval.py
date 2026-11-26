@@ -55,10 +55,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 def test_citation_cff_present_and_valid():
     cff_path = REPO_ROOT / "CITATION.cff"
-    assert cff_path.exists(), "CITATION.cff missing for v1.0 release"
+    assert cff_path.exists(), "CITATION.cff missing for v0.1.0 release"
     txt = cff_path.read_text(encoding="utf-8")
     assert 'cff-version: 1.2.0' in txt
-    assert 'version: "1.0.0"' in txt
+    assert 'version: "0.1.0"' in txt
     assert 'repository-code: "https://github.com/sidthebuilder/GrammarGate"' in txt
 
 

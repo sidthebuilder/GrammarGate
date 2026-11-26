@@ -618,11 +618,11 @@
           </p>
 
           <p class="hero-desc">
-            GrammarGate checks raw logits before the bitmask is applied and monitors rolling prefixes mid-generation. On Qwen2.5-3B-Instruct with XGrammar, it caught 30 of 30 tested smoke attacks without changing model weights.
+            GrammarGate checks raw logits before the bitmask is applied, pairs residual-stream refusal probing (<code class="font-mono text-xs">HS-Gate</code> / <code class="font-mono text-xs">LanguageRoutedRefusalProbe</code>) with KV lookahead (<code class="font-mono text-xs">SpecLook</code>), and monitors rolling leaf prefixes mid-generation (<code class="font-mono text-xs">Plane-Sync</code>). Ubuntu CI passes native Rust L1 FFI, live <code class="font-mono text-xs">xgrammar&gt;=0.2.9</code> bitmasking, and the zero-synthetic 650-item HF evaluation harness (<code class="font-mono text-xs">v0.1.0</code>).
           </p>
 
           <div class="hero-meta">
-            Open-source research prototype by Shashank Kumar · Rust, XGrammar, vLLM V1
+            v0.1.0 Open-Source Research Prototype by Shashank Kumar · Rust, XGrammar, HF &amp; vLLM V1
           </div>
 
           <div class="hero-actions">
@@ -859,30 +859,30 @@
 
         <div class="limits-grid">
           <div class="limit-item">
-            <div class="limit-title">1. Small Sample Smoke Test (N=10)</div>
+            <div class="limit-title">1. Small-N GPU/CPU Evaluations &amp; Pending Cloud Sweep</div>
             <div class="limit-desc">
-              The 40-task benchmark serves as a local hardware validation harness. Establishing asymptotic true positive and false positive rates requires scaling to N &ge; 1,000 across diverse model architectures (Llama, Mistral, Gemma).
+              The recorded <code class="font-mono text-xs">results_real_3b.jsonl</code> (N=10/cat) and <code class="font-mono text-xs">results_ablation_05b.jsonl</code> (N=5/cat) sweeps validate behavior on small local runs. The zero-synthetic 650-item HF suite (<code class="font-mono text-xs">JBB-Behaviors</code>, <code class="font-mono text-xs">JSONSchemaBench</code>, <code class="font-mono text-xs">HumanEval</code>) is CI-verified via <code class="font-mono text-xs">xgrammar&gt;=0.2.9</code>, while optional multi-model CUDA runs (<code class="font-mono text-xs">modal_vllm_eval.py</code> across Qwen3-4B, Phi-4-mini, and OLMo-2-7B) await cloud GPU execution.
             </div>
           </div>
 
           <div class="limit-item">
-            <div class="limit-title">2. Heuristic Layer 3 Monitoring</div>
+            <div class="limit-title">2. Few-Shot Multilingual Probe Coverage</div>
             <div class="limit-desc">
-              Layer 3 currently uses a deterministic regex pattern scanner to inspect materialized dictionary payloads. For enterprise natural-language outputs, Layer 3 must be backed by a distilled 0.5B token-classifier safety judge.
+              In <code class="font-mono text-xs">hs_probe.py</code>, pooling 5 languages degraded English CodeSpear separation (<code class="font-mono text-xs">0.0% &rarr; 40.0% ASR</code>). <code class="font-mono text-xs">LanguageRoutedRefusalProbe</code> restores <code class="font-mono text-xs">0.0%</code> EN CodeSpear ASR (<code class="font-mono text-xs">AUC=1.000</code>) and lifts <code class="font-mono text-xs">JBB_15</code> Hindi (<code class="font-mono text-xs">-0.109 &rarr; +0.413</code>), ES (<code class="font-mono text-xs">+0.4776</code>), and FR (<code class="font-mono text-xs">+0.2213</code>), though 4-pair non-EN directions still miss unseen phrasings on <code class="font-mono text-xs">0.5B</code> (<code class="font-mono text-xs">Multi ASR=40.0%</code>).
             </div>
           </div>
 
           <div class="limit-item">
-            <div class="limit-title">3. Low-Refusal Stealth Decoupling</div>
+            <div class="limit-title">3. Layer 1 Enum &amp; Low-Refusal Decoupling</div>
             <div class="limit-desc">
-              If an attacker phrases a prompt such that baseline refusal probability is near zero and uses a loose grammar (<code class="font-mono text-xs">killed_mass &lt; 0.98</code>), logit thresholding alone cannot distinguish malicious intent without semantic monitoring.
+              Standalone <code class="font-mono text-xs">HS-Gate</code> misses forced-prefix EnumAttacks and fragmented DictAttacks with benign prompts. GrammarGate resolves this across planes: Layer 1 covers forced enums while preserving multi-option API enums, <code class="font-mono text-xs">HS-Gate</code> covers CodeSpear, and Plane-Sync Layer 3 catches assembled splits via <code class="font-mono text-xs">SemanticSafetyJudge</code> + <code class="font-mono text-xs">finalize()</code>.
             </div>
           </div>
 
           <div class="limit-item">
-            <div class="limit-title">4. Mid-Generation Trips on Raw Python CFGs (20% FPR)</div>
+            <div class="limit-title">4. Unpartitioned Lexical FPR vs. SpecLook &amp; HS-Gate</div>
             <div class="limit-desc">
-              Under the <code class="font-mono text-xs">0.01</code> threshold override (vs. <code class="font-mono text-xs">0.15</code> default), <code class="font-mono text-xs">benign_py_3</code> (10 tokens) and <code class="font-mono text-xs">benign_py_5</code> (16 tokens) tripped <code class="font-mono text-xs">L2</code> after emitting valid Python code. Allowing optional prose/fence wrappers via <code class="font-mono text-xs">wrap_ebnf_with_preamble</code> in <code class="font-mono text-xs">grammargate/preamble_utils.py</code> mitigates un-fenced prose suppression.
+              Under the raw <code class="font-mono text-xs">0.01</code> lexical threshold in <code class="font-mono text-xs">results_real_3b.jsonl</code>, un-fenced Python CFGs incurred <code class="font-mono text-xs">20.0%</code> FPR (<code class="font-mono text-xs">80.0%</code> on <code class="font-mono text-xs">0.5B</code> <code class="font-mono text-xs">Lexical-L2</code>). Upgrading to <code class="font-mono text-xs">SpecLook-Gate</code> (KV rollback) and <code class="font-mono text-xs">HS-Gate</code> reduced <code class="font-mono text-xs">0.5B</code> Benign FPR to <code class="font-mono text-xs">0.0%</code>.
             </div>
           </div>
         </div>
@@ -894,35 +894,35 @@
             <thead>
               <tr>
                 <th>Dimension</th>
-                <th>Current Prototype Status</th>
+                <th>Current v0.1.0 Verified Status</th>
                 <th>Enterprise Production Target</th>
               </tr>
             </thead>
             <tbody style="font-size: 13px;">
               <tr>
-                <td style="font-weight: 500;">Defense Invariance</td>
-                <td style="color: var(--botanical-green);">Empirically Verified Prototype (Single-Stream)</td>
-                <td>Formal verification across arbitrary sampling methods (top-p, min-p)</td>
+                <td style="font-weight: 500;">Defense Architecture</td>
+                <td style="color: var(--botanical-green);">3-Plane Verified Prototype (Rust L1 + SpecLook &amp; HS-Gate L2 + Plane-Sync L3)</td>
+                <td>Multi-model CUDA verification across N &ge; 100 public benchmarks per category</td>
               </tr>
               <tr>
                 <td style="font-weight: 500;">Layer 1 Static Analyzer</td>
-                <td style="color: var(--botanical-green);">Caller-allocated FFI cdylib (&lt; 20 μs, zero leaks)</td>
+                <td style="color: var(--botanical-green);">Rust AST ($ref, \uXXXX, comments, benign multi-option enums &lt; 20 &mu;s)</td>
                 <td>Complete JSON Schema draft-07/2020-12 specification compliance</td>
               </tr>
               <tr>
                 <td style="font-weight: 500;">Layer 2 Pre-Mask Gate</td>
-                <td style="color: var(--botanical-green);">Vectorized PyTorch GPU math (2.04 ms/tok)</td>
+                <td style="color: var(--botanical-green);">Single-sync sparse PyTorch gate + LanguageRoutedRefusalProbe + KV lookahead</td>
                 <td>Fused CUDA C++ kernel integrated directly into engine sampler</td>
               </tr>
               <tr>
-                <td style="font-weight: 500;">Engine Integration</td>
-                <td>HF processor; vLLM V0 callable &amp; V1 BatchUpdate shim</td>
+                <td style="font-weight: 500;">Engine &amp; CI Integration</td>
+                <td style="color: var(--botanical-green);">HF + vLLM V0/V1; Ubuntu CI green with xgrammar&gt;=0.2.9 &amp; 650-item HF corpus</td>
                 <td>Upstream PRs merged into vllm-project/vllm and sgl-project/sglang</td>
               </tr>
               <tr>
-                <td style="font-weight: 500;">False Positive Rate</td>
-                <td style="color: var(--accent-terracotta);">20.0% on raw code CFGs (conversational prose)</td>
-                <td>&lt; 0.1% FPR via fenced code-block grammars or stop-sequence rules</td>
+                <td style="font-weight: 500;">False Positive &amp; Language</td>
+                <td>0.0% Benign FPR on 0.5B Combined (down from 20.0% raw 3B lexical baseline); 40.0% multi-lang few-shot ASR gap</td>
+                <td>Rich multi-lingual refusal calibration (&ge; 50 pairs/language) + fenced CFGs</td>
               </tr>
             </tbody>
           </table>
@@ -933,10 +933,10 @@
     <!-- SECTION 5: REPRODUCE & COMMANDS -->
     <section id="reproduce">
       <div class="container">
-        <span class="section-eyebrow">Section 05 · Local Verification</span>
+        <span class="section-eyebrow">Section 05 · Local &amp; CI Verification</span>
         <h2 class="section-h2">Reproduce Locally</h2>
         <p class="section-lead">
-          GrammarGate compiles with standard Rust and Python tools on Linux or Windows:
+          GrammarGate compiles cleanly on Linux/WSL2/macOS (full native Rust + XGrammar runs in Ubuntu CI):
         </p>
 
         <!-- Command 0 -->
@@ -953,14 +953,14 @@
 
         <!-- Command 2 -->
         <div class="repro-box">
-          <code>pytest tests/test_rust_core.py tests/test_rust_analyzer.py tests/test_logit_gate.py tests/test_escalator.py tests/test_vllm_adapter.py benchmarks/attacks/ benchmarks/utility/ -v</code>
-          <button class="btn-copy" onclick="copySnippet(this, 'pytest tests/test_rust_core.py tests/test_rust_analyzer.py tests/test_logit_gate.py tests/test_escalator.py tests/test_vllm_adapter.py benchmarks/attacks/ benchmarks/utility/ -v')">Copy</button>
+          <code>PYTHONPATH=. pytest tests/test_rust_core.py tests/test_rust_analyzer.py tests/test_native_xgrammar_ci.py tests/test_principal_eval.py -v</code>
+          <button class="btn-copy" onclick="copySnippet(this, 'PYTHONPATH=. pytest tests/test_rust_core.py tests/test_rust_analyzer.py tests/test_native_xgrammar_ci.py tests/test_principal_eval.py -v')">Copy</button>
         </div>
 
         <!-- Command 3 -->
         <div class="repro-box">
-          <code>python benchmarks/run_real_eval.py</code>
-          <button class="btn-copy" onclick="copySnippet(this, 'python benchmarks/run_real_eval.py')">Copy</button>
+          <code>modal run benchmarks/modal_vllm_eval.py --smoke</code>
+          <button class="btn-copy" onclick="copySnippet(this, 'modal run benchmarks/modal_vllm_eval.py --smoke')">Copy</button>
         </div>
       </div>
     </section>
