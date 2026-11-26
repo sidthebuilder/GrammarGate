@@ -709,8 +709,13 @@ def evaluate_model(
             for rec in records:
                 rf.write(json.dumps(rec) + "\n")
 
+        try:
+            raw_ref = str(raw_path.resolve().relative_to(REPO_ROOT.resolve()))
+        except ValueError:
+            raw_ref = str(raw_path)
+
         summary_by_regime[f"{regime_name}_s{r_seed}"] = {
-            "raw_jsonl": str(raw_path.relative_to(REPO_ROOT)),
+            "raw_jsonl": raw_ref,
             "modes": mode_summaries,
         }
 
